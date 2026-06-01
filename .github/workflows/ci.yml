@@ -57,6 +57,36 @@ jobs:
         # docker-container driver Buildx sets up here can.
         uses: docker/setup-buildx-action@v3
 
+      - name: Build image for scanning
+        # Single-arch amd64 build loaded into the local daemon so Trivy can scan
+        # it. Runs on every branch (not just main). Shares the GHA layer cache
+        # with the multi-arch push below, so nothing is built twice.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: pgdx:scan
+          build-args: |
+            VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image with Trivy
+        # Fail on fixable CRITICAL/HIGH vulnerabilities; unfixed ones are reported
+        # but don't break the build (ignore-unfixed).
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: pgdx:scan
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+          vuln-type: os,library
+        env:
+          # Authenticate the vuln-DB pull from GHCR to avoid anonymous rate limits.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Log in to GHCR
         # Only authenticate when we intend to push (main branch or version tags).
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
@@ -68,6 +98,8 @@ jobs:
 
       - name: Derive image metadata
         id: meta
+        # Only needed for the push below, which runs on main / version tags.
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/capitaltg/pgdx
@@ -78,12 +110,14 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
+        # Multi-arch build + push only on main / version tags. Other branches stop
+        # after the amd64 scan build above, which already validates the Dockerfile.
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          # Push only on main or version tags; otherwise just validate the build.
-          push: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |

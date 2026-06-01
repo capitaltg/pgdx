@@ -33,7 +33,7 @@ func newQueryCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, "", flagDatabase, sqlLog(cmd))
+			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
 			if err != nil {
 				return err
 			}

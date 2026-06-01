@@ -72,7 +72,7 @@ func runSignal(cmd *cobra.Command, pidArg string, terminate, force bool) error {
 
 	noteContext(cmd)
 	ctx := context.Background()
-	conn, err := db.Connect(ctx, flagDSN, "", flagDatabase, sqlLog(cmd))
+	conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
 	if err != nil {
 		return err
 	}

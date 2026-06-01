@@ -2,11 +2,13 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/spf13/cobra"
 
 	"github.com/capitaltg/pgdx/internal/catalog"
@@ -121,7 +123,7 @@ func runExplain(cmd *cobra.Command, args []string) error {
 	noteContext(cmd)
 
 	ctx := context.Background()
-	conn, err := db.Connect(ctx, flagDSN, "", flagDatabase, sqlLog(cmd))
+	conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
 	if err != nil {
 		return err
 	}
@@ -152,7 +154,7 @@ func runExplain(cmd *cobra.Command, args []string) error {
 			// Open the new connection BEFORE closing the old one, so a failure (e.g. no
 			// CONNECT on an internal database like rdsadmin) leaves `conn` valid for the
 			// deferred close — and never nil.
-			newConn, cerr := db.Connect(ctx, flagDSN, "", info.Database, sqlLog(cmd))
+			newConn, cerr := db.Connect(ctx, flagDSN, flagTimeout, info.Database, sqlLog(cmd))
 			if cerr != nil {
 				return fmt.Errorf("can't connect to %q (the backend's database) to explain there — you may lack CONNECT on it: %w", info.Database, cerr)
 			}
@@ -201,6 +203,12 @@ func runExplain(cmd *cobra.Command, args []string) error {
 		raw, err = conn.RunExplain(ctx, stmts)
 	}
 	if err != nil {
+		// --analyze runs the query, so a slow one trips pgdx's statement_timeout
+		// (SQLSTATE 57014). Point at --timeout unless the user already raised it.
+		var pgErr *pgconn.PgError
+		if flagAnalyze && flagTimeout == "" && errors.As(err, &pgErr) && pgErr.Code == "57014" {
+			return fmt.Errorf("%w\nhint: --analyze executes the query and pgdx caps it at %s; raise the limit, e.g. `--timeout 2m`", err, db.DefaultStatementTimeout)
+		}
 		return err
 	}
 
