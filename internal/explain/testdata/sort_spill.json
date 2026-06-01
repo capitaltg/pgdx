@@ -1,0 +1,77 @@
+[
+  {
+    "Plan": {
+      "Node Type": "Gather Merge",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Startup Cost": 212587.55,
+      "Total Cost": 407045.49,
+      "Plan Rows": 1666666,
+      "Plan Width": 43,
+      "Actual Startup Time": 1716.986,
+      "Actual Total Time": 4896.296,
+      "Actual Rows": 2000000,
+      "Actual Loops": 1,
+      "Workers Planned": 2,
+      "Workers Launched": 2,
+      "Plans": [
+        {
+          "Node Type": "Sort",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 211587.52,
+          "Total Cost": 213670.86,
+          "Plan Rows": 833333,
+          "Plan Width": 43,
+          "Actual Startup Time": 1712.252,
+          "Actual Total Time": 2420.333,
+          "Actual Rows": 666667,
+          "Actual Loops": 3,
+          "Sort Key": ["note"],
+          "Sort Method": "external merge",
+          "Sort Space Used": 34960,
+          "Sort Space Type": "Disk",
+          "Workers": [
+            {
+              "Worker Number": 0,
+              "Sort Method": "external merge",
+              "Sort Space Used": 35016,
+              "Sort Space Type": "Disk"
+            },
+            {
+              "Worker Number": 1,
+              "Sort Method": "external merge",
+              "Sort Space Used": 34608,
+              "Sort Space Type": "Disk"
+            }
+          ],
+          "Plans": [
+            {
+              "Node Type": "Seq Scan",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": true,
+              "Async Capable": false,
+              "Relation Name": "awards",
+              "Alias": "awards",
+              "Startup Cost": 0.00,
+              "Total Cost": 27085.33,
+              "Plan Rows": 833333,
+              "Plan Width": 43,
+              "Actual Startup Time": 0.022,
+              "Actual Total Time": 487.240,
+              "Actual Rows": 666667,
+              "Actual Loops": 3,
+              "Workers": [
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "Planning Time": 0.203,
+    "Triggers": [
+    ],
+    "Execution Time": 6249.793
+  }
+]

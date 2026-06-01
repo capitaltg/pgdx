@@ -1,0 +1,59 @@
+[
+  {
+    "Plan": {
+      "Async Capable": false,
+      "Node Type": "Aggregate",
+      "Parallel Aware": false,
+      "Partial Mode": "Finalize",
+      "Plan Rows": 1,
+      "Plan Width": 8,
+      "Plans": [
+        {
+          "Async Capable": false,
+          "Node Type": "Gather",
+          "Parallel Aware": false,
+          "Parent Relationship": "Outer",
+          "Plan Rows": 2,
+          "Plan Width": 8,
+          "Plans": [
+            {
+              "Async Capable": false,
+              "Node Type": "Aggregate",
+              "Parallel Aware": false,
+              "Parent Relationship": "Outer",
+              "Partial Mode": "Partial",
+              "Plan Rows": 1,
+              "Plan Width": 8,
+              "Plans": [
+                {
+                  "Alias": "awards",
+                  "Async Capable": false,
+                  "Index Name": "awards_date_signed_idx",
+                  "Node Type": "Index Only Scan",
+                  "Parallel Aware": true,
+                  "Parent Relationship": "Outer",
+                  "Plan Rows": 21560132,
+                  "Plan Width": 0,
+                  "Relation Name": "awards",
+                  "Scan Direction": "Forward",
+                  "Startup Cost": 0.56,
+                  "Total Cost": 1078510.35
+                }
+              ],
+              "Startup Cost": 1132410.68,
+              "Strategy": "Plain",
+              "Total Cost": 1132410.69
+            }
+          ],
+          "Single Copy": false,
+          "Startup Cost": 1133410.68,
+          "Total Cost": 1133410.89,
+          "Workers Planned": 2
+        }
+      ],
+      "Startup Cost": 1133410.9,
+      "Strategy": "Plain",
+      "Total Cost": 1133410.91
+    }
+  }
+]

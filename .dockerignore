@@ -1,0 +1,23 @@
+# Build artifacts
+/pgdx
+/dist/
+*.test
+*.out
+coverage.*
+
+# VCS & tooling
+.git/
+.github/
+.claude/
+
+# Local config / secrets — never bake these into an image
+*.env
+.env
+.pgpass
+*.pg_service.conf
+
+# Docs & editor cruft
+*.md
+.idea/
+.vscode/
+.DS_Store

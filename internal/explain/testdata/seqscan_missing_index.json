@@ -1,0 +1,46 @@
+[
+  {
+    "Plan": {
+      "Node Type": "Gather",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Startup Cost": 1000.00,
+      "Total Cost": 30168.77,
+      "Plan Rows": 1,
+      "Plan Width": 43,
+      "Actual Startup Time": 1.439,
+      "Actual Total Time": 39.870,
+      "Actual Rows": 1,
+      "Actual Loops": 1,
+      "Workers Planned": 2,
+      "Workers Launched": 2,
+      "Single Copy": false,
+      "Plans": [
+        {
+          "Node Type": "Seq Scan",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": true,
+          "Async Capable": false,
+          "Relation Name": "awards",
+          "Alias": "awards",
+          "Startup Cost": 0.00,
+          "Total Cost": 29168.67,
+          "Plan Rows": 1,
+          "Plan Width": 43,
+          "Actual Startup Time": 22.806,
+          "Actual Total Time": 34.827,
+          "Actual Rows": 0,
+          "Actual Loops": 3,
+          "Filter": "(id = 12345)",
+          "Rows Removed by Filter": 666666,
+          "Workers": [
+          ]
+        }
+      ]
+    },
+    "Planning Time": 0.433,
+    "Triggers": [
+    ],
+    "Execution Time": 39.919
+  }
+]

@@ -1,0 +1,38 @@
+# Compiled pgdx binary (built with `go build -o pgdx .`)
+/pgdx
+
+# Go build / test artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+/dist/
+
+# Go workspace files (keep go.mod / go.sum tracked)
+go.work
+go.work.sum
+
+# Local connection config / secrets — never commit these
+*.env
+.env
+.pgpass
+*.pg_service.conf
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Claude Code workspace scaffolding (not part of the pgdx tool;
+# remove this line if your team wants to track it)
+.claude/

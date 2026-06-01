@@ -1,0 +1,58 @@
+[
+  {
+    "Plan": {
+      "Async Capable": false,
+      "Node Type": "Aggregate",
+      "Parallel Aware": false,
+      "Partial Mode": "Finalize",
+      "Plan Rows": 1,
+      "Plan Width": 8,
+      "Plans": [
+        {
+          "Async Capable": false,
+          "Node Type": "Gather",
+          "Parallel Aware": false,
+          "Parent Relationship": "Outer",
+          "Plan Rows": 2,
+          "Plan Width": 8,
+          "Plans": [
+            {
+              "Async Capable": false,
+              "Node Type": "Aggregate",
+              "Parallel Aware": false,
+              "Parent Relationship": "Outer",
+              "Partial Mode": "Partial",
+              "Plan Rows": 1,
+              "Plan Width": 8,
+              "Plans": [
+                {
+                  "Alias": "awards",
+                  "Async Capable": false,
+                  "Filter": "(pop_start = '2026-01-01'::date)",
+                  "Node Type": "Seq Scan",
+                  "Parallel Aware": true,
+                  "Parent Relationship": "Outer",
+                  "Plan Rows": 5722,
+                  "Plan Width": 0,
+                  "Relation Name": "awards",
+                  "Startup Cost": 0,
+                  "Total Cost": 4546527.65
+                }
+              ],
+              "Startup Cost": 4546541.95,
+              "Strategy": "Plain",
+              "Total Cost": 4546541.96
+            }
+          ],
+          "Single Copy": false,
+          "Startup Cost": 4547541.95,
+          "Total Cost": 4547542.16,
+          "Workers Planned": 2
+        }
+      ],
+      "Startup Cost": 4547542.17,
+      "Strategy": "Plain",
+      "Total Cost": 4547542.18
+    }
+  }
+]
