@@ -75,7 +75,7 @@ func resolveDiffPair(cmd *cobra.Command, args []string) (older, newer *snapshot.
 func captureLiveForDiff(cmd *cobra.Command) (*snapshot.Snapshot, error) {
 	noteContext(cmd)
 	ctx := context.Background()
-	conn, err := db.Connect(ctx, flagDSN, "", flagDatabase, sqlLog(cmd))
+	conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
 	if err != nil {
 		return nil, err
 	}

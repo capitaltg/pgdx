@@ -860,7 +860,7 @@ func connectForGet(cmd *cobra.Command) (render.Format, *db.Conn, error) {
 		return "", nil, usageError{err.Error()}
 	}
 	noteContext(cmd)
-	conn, err := db.Connect(context.Background(), flagDSN, "", flagDatabase, sqlLog(cmd))
+	conn, err := db.Connect(context.Background(), flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
 	if err != nil {
 		return "", nil, err
 	}
@@ -1098,7 +1098,7 @@ func newGetSlowQueriesCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, "", flagDatabase, sqlLog(cmd))
+			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
 			if err != nil {
 				return err
 			}
@@ -1249,7 +1249,7 @@ func newGetLocksCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, "", flagDatabase, sqlLog(cmd))
+			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
 			if err != nil {
 				return err
 			}
@@ -1365,7 +1365,7 @@ func newGetActivityCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, "", flagDatabase, sqlLog(cmd))
+			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
 			if err != nil {
 				return err
 			}
@@ -1563,7 +1563,7 @@ func newGetTablesCmd() *cobra.Command {
 
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, "", flagDatabase, sqlLog(cmd))
+			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
 			if err != nil {
 				return err
 			}
@@ -1931,7 +1931,7 @@ func newGetIndexesCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, "", flagDatabase, sqlLog(cmd))
+			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
 			if err != nil {
 				return err
 			}

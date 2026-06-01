@@ -38,7 +38,7 @@ func newDescribeViewCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, "", flagDatabase, sqlLog(cmd))
+			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
 			if err != nil {
 				return err
 			}
@@ -104,7 +104,7 @@ func newDescribeTableCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, "", flagDatabase, sqlLog(cmd))
+			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
 			if err != nil {
 				return err
 			}
@@ -247,7 +247,7 @@ func newDescribeIndexCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, "", flagDatabase, sqlLog(cmd))
+			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
 			if err != nil {
 				return err
 			}

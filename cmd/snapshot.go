@@ -79,7 +79,7 @@ func collectSnapshot(ctx context.Context, cmd *cobra.Command, conn *db.Conn, lab
 func captureSnapshot(cmd *cobra.Command, format render.Format, label string) error {
 	noteContext(cmd)
 	ctx := context.Background()
-	conn, err := db.Connect(ctx, flagDSN, "", flagDatabase, sqlLog(cmd))
+	conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
 	if err != nil {
 		return err
 	}

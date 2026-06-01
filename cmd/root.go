@@ -22,6 +22,7 @@ var (
 	flagOutput   string
 	flagDatabase string
 	flagSQL      bool
+	flagTimeout  string
 )
 
 // sqlLog returns the writer that --sql echoes statements to (stderr, so it never mixes
@@ -70,6 +71,8 @@ func newRootCmd() *cobra.Command {
 		"connect to this database instead of the default (needs CONNECT on it)")
 	root.PersistentFlags().BoolVar(&flagSQL, "sql", false,
 		"print the SQL pgdx runs (to stderr) — handy for learning or copying the query")
+	root.PersistentFlags().StringVar(&flagTimeout, "timeout", "",
+		"per-query statement_timeout, e.g. 2m or 120s (default 15s); raise it for a slow explain --analyze")
 
 	root.AddCommand(newExplainCmd())
 	root.AddCommand(newStatusCmd())
