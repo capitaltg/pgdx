@@ -69,6 +69,44 @@ func Connect(ctx context.Context, dsn, statementTimeout, database string, sqlLog
 	return &Conn{conn: conn, sqlLog: sqlLog}, nil
 }
 
+// ConnectDatabase opens a new connection to a different database on the SAME server,
+// reusing this connection's already-resolved settings — host, port, user, auth, and the
+// statement_timeout (D6) — and only swapping the target database. The shell's `use`
+// command uses it to repoint a session without re-resolving env/$PGSERVICE/.pgpass. The
+// caller owns the returned connection (and still owns the receiver).
+func (c *Conn) ConnectDatabase(ctx context.Context, database string) (*Conn, error) {
+	cfg := c.conn.Config().Copy()
+	cfg.Database = database
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	return &Conn{conn: conn, sqlLog: c.sqlLog}, nil
+}
+
+// ConnectWithoutTimeout opens a new connection to the SAME target as c (host, port, user,
+// auth, AND database), but with no statement_timeout — for VACUUM, which can legitimately
+// run far longer than D6's default cap. Cloning c's resolved config is what lets the
+// shell's `vacuum` reach the session's database even though the per-command flags have
+// been reset. The caller owns the returned connection.
+func (c *Conn) ConnectWithoutTimeout(ctx context.Context) (*Conn, error) {
+	cfg := c.conn.Config().Copy()
+	delete(cfg.RuntimeParams, "statement_timeout")
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	return &Conn{conn: conn, sqlLog: c.sqlLog}, nil
+}
+
+// Cancel asks the server to cancel whatever query is currently running on this
+// connection, using Postgres's out-of-band cancellation (a separate short-lived
+// connection) — the same mechanism psql's Ctrl-C uses. It's safe to call from another
+// goroutine while the connection is busy, and is a harmless no-op when nothing is running.
+func (c *Conn) Cancel(ctx context.Context) error {
+	return c.conn.PgConn().CancelRequest(ctx)
+}
+
 // Close releases the connection.
 func (c *Conn) Close(ctx context.Context) error { return c.conn.Close(ctx) }
 

@@ -123,12 +123,12 @@ func newStatusCmd() *cobra.Command {
 }
 
 func runStatus(cmd *cobra.Command, verbose bool, watch time.Duration) error {
-	format, conn, err := connectForGet(cmd)
+	format, conn, release, err := connectForGet(cmd)
 	if err != nil {
 		return err
 	}
 	ctx := context.Background()
-	defer conn.Close(ctx)
+	defer release()
 
 	// A privilege note (not a check): without pg_monitor, other users' detail is masked,
 	// but the counts these checks rely on still hold. Print once, even when watching.

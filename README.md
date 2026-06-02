@@ -103,6 +103,36 @@ pgdx config delete-context prod
 **Precedence** when choosing where to connect: an explicit `--dsn` or `$PGHOST`/
 `$PGSERVICE` always wins over the stored default context.
 
+## Interactive shell
+
+`pgdx shell` opens a session on a **single read-only connection** and keeps it open, so a
+triage session runs many commands without reconnecting each time. At the prompt you type
+the same commands you'd pass on the CLI — `get`, `describe`, `status`, `explain`, `query`,
+`diff`, `snapshot`, `vacuum` — with the same flags.
+
+```console
+$ pgdx shell                              # or: pgdx shell -d analytics / --dsn ... / PGSERVICE=prod pgdx shell
+pgdx shell — read-only by default, on db.example.com:5432/shop
+pgdx/shop=> get tables
+pgdx/shop=> describe table public.orders
+pgdx/shop=> use analytics                 # switch the whole session to another database
+pgdx/analytics=> use schema reporting      # set the default schema (search_path) for unqualified names
+pgdx/analytics:reporting=> query "select count(*) from events"
+pgdx/analytics:reporting=> \q              # or: exit / quit / Ctrl-D
+```
+
+- **Editing & history:** Tab-completes commands, flags, and — for `describe table|view|index`
+  and `vacuum` — live object names; ↑/↓ recall prior commands (history is saved to
+  `~/.config/pgdx/shell_history`), Ctrl-R searches it, Ctrl/Alt-←/→ move by word, Home/End
+  jump to the line ends, Ctrl-W deletes the previous word.
+- **`use <database>`** switches the session to another database (same server); **`use schema <name>`**
+  sets `search_path` so unqualified names in `query` resolve there. The prompt reflects both
+  (`pgdx/db:schema=>`).
+- **Ctrl-C** cancels the running query and returns to the prompt — it does *not* kill the
+  session.
+- Read-only by default, exactly like one-shot `pgdx`; every query still runs under the
+  `statement_timeout`. The single connection means context notes are shown once, in the banner.
+
 ## Commands
 
 ### Triage
@@ -223,6 +253,7 @@ pgdx get indexes --sort size          # order by index size (biggest first); als
 pgdx get indexes --redundant          # indexes covered by another (duplicate or prefix) — safe drops
 pgdx get bloat [--limit N]            # leaderboard: tables ranked by est. reclaimable space
 pgdx get views | sequences | functions | schemas | extensions
+pgdx get sequences                    # incl. MAX-VALUE and USED% — catch int4 sequences nearing overflow
 pgdx get extensions --available       # everything installable here (version, installed?, trusted?)
 pgdx get databases [--sort name|size] # databases: size, conns, commits/writes (activity)
 pgdx get databases --sample 5s        # COMMITS/s + WRITES/s — is a database actually active?

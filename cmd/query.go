@@ -33,11 +33,11 @@ func newQueryCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
+			conn, release, err := dial(ctx, cmd, flagDatabase)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(ctx)
+			defer release()
 
 			res, err := conn.RunReadOnlyQuery(ctx, args[0])
 			if err != nil {

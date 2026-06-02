@@ -8,7 +8,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/capitaltg/pgdx/internal/catalog"
-	"github.com/capitaltg/pgdx/internal/db"
 )
 
 // cancel and kill act on a backend PID. PIDs come from get activity (PID column),
@@ -72,11 +71,14 @@ func runSignal(cmd *cobra.Command, pidArg string, terminate, force bool) error {
 
 	noteContext(cmd)
 	ctx := context.Background()
-	conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
+	// Route through dial so a shell session reuses its connection (cancel/kill act on
+	// cluster-global PIDs, so any database works, but reusing the session's is consistent
+	// with every other command).
+	conn, release, err := dial(ctx, cmd, flagDatabase)
 	if err != nil {
 		return err
 	}
-	defer conn.Close(ctx)
+	defer release()
 
 	// Refuse to signal pgdx's own backend.
 	if self, err := catalog.CurrentBackendPID(ctx, conn); err == nil && pid == self {

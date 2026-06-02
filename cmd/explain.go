@@ -123,15 +123,17 @@ func runExplain(cmd *cobra.Command, args []string) error {
 	noteContext(cmd)
 
 	ctx := context.Background()
-	conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
+	conn, release, err := dial(ctx, cmd, flagDatabase)
 	if err != nil {
 		return err
 	}
-	// Closure (not `defer conn.Close`) so a --pid reconnect closes the FINAL conn;
-	// nil-guarded so a failed reconnect can't panic on close.
+	// Closure (not `defer release()`) so a --pid reconnect releases the FINAL conn;
+	// nil-guarded so a failed reconnect can't panic on release. In a shell session the
+	// initial release is a no-op (the connection is shared) — only a cross-database
+	// reconnect produces a real connection to close here.
 	defer func() {
-		if conn != nil {
-			conn.Close(ctx)
+		if release != nil {
+			release()
 		}
 	}()
 
@@ -151,15 +153,17 @@ func runExplain(cmd *cobra.Command, args []string) error {
 		if info.Database != "" && info.Database != conn.Database() {
 			fmt.Fprintf(errOut, "note: backend %d is on database %q; connecting there to explain its query.\n",
 				flagExplainPID, info.Database)
-			// Open the new connection BEFORE closing the old one, so a failure (e.g. no
+			// Open the new connection BEFORE releasing the old one, so a failure (e.g. no
 			// CONNECT on an internal database like rdsadmin) leaves `conn` valid for the
-			// deferred close — and never nil.
-			newConn, cerr := db.Connect(ctx, flagDSN, flagTimeout, info.Database, sqlLog(cmd))
+			// deferred release — and never nil. info.Database differs from conn.Database()
+			// here, so dial always returns a fresh connection, even in a shell session;
+			// releasing the old one is a no-op there (it is the shared session conn).
+			newConn, newRelease, cerr := dial(ctx, cmd, info.Database)
 			if cerr != nil {
 				return fmt.Errorf("can't connect to %q (the backend's database) to explain there — you may lack CONNECT on it: %w", info.Database, cerr)
 			}
-			conn.Close(ctx)
-			conn = newConn
+			release()
+			conn, release = newConn, newRelease
 		}
 		decision, err = explainDecisionForPID(cmd, ctx, conn, int32(flagExplainPID), query)
 		if err != nil {

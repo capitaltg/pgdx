@@ -6,7 +6,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/capitaltg/pgdx/internal/db"
 	"github.com/capitaltg/pgdx/internal/render"
 	"github.com/capitaltg/pgdx/internal/snapshot"
 )
@@ -75,11 +74,11 @@ func resolveDiffPair(cmd *cobra.Command, args []string) (older, newer *snapshot.
 func captureLiveForDiff(cmd *cobra.Command) (*snapshot.Snapshot, error) {
 	noteContext(cmd)
 	ctx := context.Background()
-	conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
+	conn, release, err := dial(ctx, cmd, flagDatabase)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close(ctx)
+	defer release()
 	fmt.Fprintln(cmd.ErrOrStderr(), "comparing baseline against a fresh live reading...")
 	return collectSnapshot(ctx, cmd, conn, "live")
 }
