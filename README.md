@@ -128,8 +128,8 @@ pgdx/analytics:reporting=> \q              # or: exit / quit / Ctrl-D
 - **`use <database>`** switches the session to another database (same server); **`use schema <name>`**
   sets `search_path` so unqualified names in `query` resolve there. The prompt reflects both
   (`pgdx/db:schema=>`).
-- **Ctrl-C** cancels the running query and returns to the prompt — it does *not* kill the
-  session.
+- **Ctrl-C** cancels the running command — a slow query, explain, or a long `analyze`/`vacuum`
+  — and returns to the prompt; it does *not* kill the session.
 - Read-only by default, exactly like one-shot `pgdx`; every query still runs under the
   `statement_timeout`. The single connection means context notes are shown once, in the banner.
 
@@ -365,10 +365,18 @@ database — `snapshot` only writes a local file.
 pgdx vacuum <table>            # reclaim dead tuples (online, non-destructive)
 pgdx vacuum <table> --analyze  # also refresh planner stats
 pgdx vacuum <table> --full     # rewrite table (ACCESS EXCLUSIVE lock — asks to confirm)
+
+pgdx analyze <table>           # refresh planner statistics for one table
+pgdx analyze --schema app      # …for every table in a schema
+pgdx analyze --all             # …for every table in the current database
 ```
 
 Table/index/view names can be bare (`orders`) or schema-qualified (`reporting.orders`).
 A bare name that exists in multiple schemas asks you to qualify it.
+
+`analyze` is the fix when `get tables` shows blank ROWS/DEAD% (no statistics — e.g. just
+after a restore). ANALYZE only samples rows and runs online, but whole-database analyze is
+deliberate: it requires `--all`, never a bare `pgdx analyze`.
 
 ## Output
 

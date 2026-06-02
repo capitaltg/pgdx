@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chzyer/readline"
@@ -126,6 +127,33 @@ func shellPrompt() string {
 	return fmt.Sprintf("pgdx/%s=> ", sharedConn.Database())
 }
 
+// activeCancel is the connection a shell Ctrl-C should cancel. Most commands run on the
+// session connection (sharedConn), but write commands (vacuum/analyze) open their own via
+// writeConn and register it here for the duration — so Ctrl-C cancels a long ANALYZE or
+// VACUUM too, not just queries on the session connection.
+var (
+	activeCancelMu sync.Mutex
+	activeCancel   *db.Conn
+)
+
+// setActiveCancel registers (or clears, with nil) the connection a Ctrl-C should cancel.
+func setActiveCancel(c *db.Conn) {
+	activeCancelMu.Lock()
+	activeCancel = c
+	activeCancelMu.Unlock()
+}
+
+// cancelTarget is the connection to cancel on Ctrl-C: the active write-command connection
+// if one is running, otherwise the session connection.
+func cancelTarget() *db.Conn {
+	activeCancelMu.Lock()
+	defer activeCancelMu.Unlock()
+	if activeCancel != nil {
+		return activeCancel
+	}
+	return sharedConn
+}
+
 // errNoRawMode signals that the interactive line editor couldn't initialize, so runShell
 // falls back to the plain (no-editing, no-history) line reader.
 var errNoRawMode = errors.New("interactive line editor unavailable")
@@ -151,12 +179,13 @@ func readlineLoop(out, errOut io.Writer) error {
 	}
 	defer rl.Close()
 
-	// While a command runs, Ctrl-C cancels the in-flight query on the session connection
-	// (Postgres out-of-band cancel) instead of killing the shell — so a slow query or
-	// explain doesn't cost you the whole session. At the prompt, readline's raw mode
-	// delivers Ctrl-C as a byte (handled as ErrInterrupt below), so no signal fires there;
-	// if one somehow does, cancelling an idle connection is a no-op. (A `vacuum`, which
-	// runs on its own connection, isn't reached by this — it keeps its own no-timeout run.)
+	// While a command runs, Ctrl-C cancels the in-flight query (Postgres out-of-band
+	// cancel) instead of killing the shell — so a slow query, explain, or a long
+	// ANALYZE/VACUUM doesn't cost you the whole session. cancelTarget() picks the
+	// connection actually working (the session connection, or a write command's own). At
+	// the prompt, readline's raw mode delivers Ctrl-C as a byte (handled as ErrInterrupt
+	// below), so no signal fires there; if one somehow does, cancelling an idle connection
+	// is a no-op.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
 	defer signal.Stop(sigCh)
@@ -166,9 +195,9 @@ func readlineLoop(out, errOut io.Writer) error {
 		for {
 			select {
 			case <-sigCh:
-				if sharedConn != nil {
+				if c := cancelTarget(); c != nil {
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					_ = sharedConn.Cancel(ctx)
+					_ = c.Cancel(ctx)
 					cancel()
 				}
 			case <-stop:

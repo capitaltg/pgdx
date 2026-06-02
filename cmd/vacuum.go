@@ -34,23 +34,11 @@ func newVacuumCmd() *cobra.Command {
 			errOut := cmd.ErrOrStderr()
 			noteContext(cmd)
 			ctx := context.Background()
-			// VACUUM needs two things: the session's database (in a shell the per-command
-			// flags are reset, so re-resolving from flagDSN/flagDatabase would land on the
-			// wrong database and the table would appear "not found"), and no
-			// statement_timeout (D6's default would cancel a long VACUUM). In a shell, clone
-			// the session connection's resolved target with the timeout lifted; otherwise
-			// open a fresh connection the usual way.
-			var conn *db.Conn
-			var err error
-			if sharedConn != nil {
-				conn, err = sharedConn.ConnectWithoutTimeout(ctx)
-			} else {
-				conn, err = db.Connect(ctx, flagDSN, "0", flagDatabase, sqlLog(cmd))
-			}
+			conn, release, err := writeConn(ctx, cmd)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(ctx)
+			defer release()
 
 			rt, err := catalog.ResolveTable(ctx, conn, args[0])
 			if err != nil {
@@ -142,6 +130,31 @@ func fmtDuration(d time.Duration) string {
 	default:
 		return d.Round(time.Second).String()
 	}
+}
+
+// writeConn opens the connection for a write command (vacuum, analyze): the session's
+// database with no statement_timeout — these can run far longer than D6's default cap —
+// reusing the shell session's already-resolved target when inside `pgdx shell` (where the
+// per-command flags have been reset, so re-resolving from them would land on the wrong
+// database). Returns the connection and a release func.
+func writeConn(ctx context.Context, cmd *cobra.Command) (*db.Conn, func(), error) {
+	var conn *db.Conn
+	var err error
+	if sharedConn != nil {
+		conn, err = sharedConn.ConnectWithoutTimeout(ctx)
+	} else {
+		conn, err = db.Connect(ctx, flagDSN, "0", flagDatabase, sqlLog(cmd))
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	// Register this connection as the shell's Ctrl-C cancel target for its lifetime, so an
+	// interactive Ctrl-C cancels a long VACUUM/ANALYZE running on it (no-op outside a shell).
+	setActiveCancel(conn)
+	return conn, func() {
+		setActiveCancel(nil)
+		_ = conn.Close(ctx)
+	}, nil
 }
 
 // vacuumSQL builds the statement. Options use the parenthesized form (PG9+).

@@ -115,6 +115,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newSnapshotCmd())
 	root.AddCommand(newDiffCmd())
 	root.AddCommand(newVacuumCmd())
+	root.AddCommand(newAnalyzeCmd())
 	root.AddCommand(newCancelCmd())
 	root.AddCommand(newKillCmd())
 	root.AddCommand(newConfigCmd())
