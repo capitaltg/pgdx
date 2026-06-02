@@ -2039,10 +2039,11 @@ type Sequence struct {
 	DataType  string `json:"data_type"`
 	Increment int64  `json:"increment"`
 	LastValue *int64 `json:"last_value"` // nil if the sequence has never been used
+	MaxValue  int64  `json:"max_value"`  // ceiling the sequence can reach (its MAXVALUE)
 }
 
 func buildSequencesQuery(schema string) (string, []any) {
-	q := `SELECT schemaname, sequencename, data_type::text, increment_by, last_value
+	q := `SELECT schemaname, sequencename, data_type::text, increment_by, last_value, max_value
 FROM pg_catalog.pg_sequences
 WHERE schemaname !~ '^pg_'
   AND schemaname <> 'information_schema'`
@@ -2065,7 +2066,7 @@ func ListSequences(ctx context.Context, q Querier, schema string) ([]Sequence, e
 	var out []Sequence
 	for rows.Next() {
 		var s Sequence
-		if err := rows.Scan(&s.Schema, &s.Name, &s.DataType, &s.Increment, &s.LastValue); err != nil {
+		if err := rows.Scan(&s.Schema, &s.Name, &s.DataType, &s.Increment, &s.LastValue, &s.MaxValue); err != nil {
 			return nil, err
 		}
 		out = append(out, s)
@@ -2803,4 +2804,158 @@ func ListTables(ctx context.Context, q Querier, schema string) ([]Table, error) 
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// RelationName is a schema-qualified relation name. It is intentionally minimal (no
+// stats or sizes) so the shell's tab-completion can list candidate names on a single
+// keypress without paying the cost of the full get/describe queries.
+type RelationName struct {
+	Schema string `json:"schema"`
+	Name   string `json:"name"`
+}
+
+// ListRelationNames returns the names of relations whose relkind is in kinds — e.g.
+// 'r','p' for tables (incl. partitioned), 'v','m' for views/matviews, 'i','I' for
+// indexes — excluding system schemas. The result is capped so completion stays snappy
+// on databases with very many objects; a prefix the user is typing still narrows it.
+// kinds holds fixed single-char constants from the caller (never user input).
+func ListRelationNames(ctx context.Context, q Querier, kinds ...string) ([]RelationName, error) {
+	if len(kinds) == 0 {
+		return nil, nil
+	}
+	const sql = `SELECT n.nspname, c.relname
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind::text = ANY($1)
+  AND n.nspname !~ '^pg_'
+  AND n.nspname <> 'information_schema'
+ORDER BY n.nspname, c.relname
+LIMIT 5000`
+	rows, err := q.Query(ctx, sql, kinds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RelationName
+	for rows.Next() {
+		var r RelationName
+		if err := rows.Scan(&r.Schema, &r.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListDatabaseNames returns the names of connectable, non-template databases, for the
+// shell's `use <database>` tab-completion. It is intentionally minimal (names only),
+// unlike ListDatabases which gathers sizes and stats for `pgdx get databases`.
+func ListDatabaseNames(ctx context.Context, q Querier) ([]string, error) {
+	const sql = `SELECT datname
+FROM pg_catalog.pg_database
+WHERE datallowconn AND NOT datistemplate
+ORDER BY datname`
+	rows, err := q.Query(ctx, sql)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
+// SchemaExists reports whether a schema of the given name exists. The shell's
+// `use schema <name>` uses it to reject a typo before changing search_path (Postgres
+// itself accepts a non-existent schema in search_path and silently ignores it).
+func SchemaExists(ctx context.Context, q Querier, name string) (bool, error) {
+	rows, err := q.Query(ctx, `SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1)`, name)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var ok bool
+	if rows.Next() {
+		if err := rows.Scan(&ok); err != nil {
+			return false, err
+		}
+	}
+	return ok, rows.Err()
+}
+
+// SetSearchPath sets the session search_path to a single schema and returns the value
+// actually applied. The name is passed through quote_ident so identifiers needing quotes
+// are handled safely. It must run outside a transaction (autocommit) so the setting
+// persists for the rest of the session; it's a session GUC change, not a data write, so
+// it's allowed under pgdx's read-only posture.
+func SetSearchPath(ctx context.Context, q Querier, schema string) (string, error) {
+	rows, err := q.Query(ctx, `SELECT set_config('search_path', quote_ident($1), false)`, schema)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var applied string
+	if rows.Next() {
+		if err := rows.Scan(&applied); err != nil {
+			return "", err
+		}
+	}
+	return applied, rows.Err()
+}
+
+// ListSchemaNames returns user schema names (system schemas excluded), for the shell's
+// `use schema <TAB>` completion.
+func ListSchemaNames(ctx context.Context, q Querier) ([]string, error) {
+	const sql = `SELECT nspname
+FROM pg_catalog.pg_namespace
+WHERE nspname !~ '^pg_' AND nspname <> 'information_schema'
+ORDER BY nspname`
+	rows, err := q.Query(ctx, sql)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// TableStats is a lightweight snapshot of a table's tuple counts and on-disk size, used
+// by `pgdx vacuum` to report what a run reclaimed (sampled before and after).
+type TableStats struct {
+	LiveTup   int64 `json:"live_tuples"`
+	DeadTup   int64 `json:"dead_tuples"`
+	SizeBytes int64 `json:"size_bytes"` // pg_total_relation_size (heap + indexes + TOAST)
+}
+
+// GetTableStats reads a table's live/dead tuple counts (pg_stat_all_tables) and total
+// relation size by OID. Used around a VACUUM to compute tuples reclaimed and space freed.
+func GetTableStats(ctx context.Context, q Querier, oid uint32) (TableStats, error) {
+	var s TableStats
+	rows, err := q.Query(ctx, `SELECT COALESCE(st.n_live_tup, 0), COALESCE(st.n_dead_tup, 0),
+       pg_catalog.pg_total_relation_size($1)::bigint
+FROM (SELECT $1::oid AS oid) o
+LEFT JOIN pg_catalog.pg_stat_all_tables st ON st.relid = o.oid`, oid)
+	if err != nil {
+		return s, err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		if err := rows.Scan(&s.LiveTup, &s.DeadTup, &s.SizeBytes); err != nil {
+			return s, err
+		}
+	}
+	return s, rows.Err()
 }

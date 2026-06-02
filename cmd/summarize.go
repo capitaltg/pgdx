@@ -31,12 +31,12 @@ func newSummarizeCmd() *cobra.Command {
 			"it at another one (needs CONNECT). Use -o json for the full structured figures.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
 			ctx := context.Background()
-			defer conn.Close(ctx)
+			defer release()
 
 			sum, err := catalog.SummarizeDatabase(ctx, conn, top)
 			if err != nil {

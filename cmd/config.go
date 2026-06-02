@@ -64,7 +64,11 @@ func newGetContextsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			current := os.Getenv("PGSERVICE")
+			// Mark the active context with the same precedence current-context uses
+			// ($PGSERVICE, else the pgdx default). Reading $PGSERVICE alone missed the
+			// pgdx default, so the marker only appeared inside `pgdx shell` (which sets
+			// $PGSERVICE at startup) and never from a one-shot CLI invocation.
+			current, _ := effectiveContext()
 			view := contextsView{}
 			for _, name := range f.Services() {
 				kv, _ := f.Get(name)

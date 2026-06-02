@@ -7,7 +7,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/capitaltg/pgdx/internal/catalog"
-	"github.com/capitaltg/pgdx/internal/db"
 	"github.com/capitaltg/pgdx/internal/render"
 )
 
@@ -38,11 +37,11 @@ func newDescribeViewCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
+			conn, release, err := dial(ctx, cmd, flagDatabase)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(ctx)
+			defer release()
 
 			d, err := catalog.DescribeView(ctx, conn, args[0])
 			if err != nil {
@@ -104,11 +103,11 @@ func newDescribeTableCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
+			conn, release, err := dial(ctx, cmd, flagDatabase)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(ctx)
+			defer release()
 
 			detail, err := catalog.DescribeTable(ctx, conn, args[0])
 			if err != nil {
@@ -247,11 +246,11 @@ func newDescribeIndexCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
+			conn, release, err := dial(ctx, cmd, flagDatabase)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(ctx)
+			defer release()
 
 			d, err := catalog.DescribeIndex(ctx, conn, args[0])
 			if err != nil {

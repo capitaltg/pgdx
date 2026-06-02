@@ -25,6 +25,26 @@ func TestWithThousands(t *testing.T) {
 	}
 }
 
+func TestTableRows(t *testing.T) {
+	cases := []struct {
+		name string
+		row  catalog.Table
+		want string
+	}{
+		{"analyzed: planner estimate", catalog.Table{EstRows: 1000, LiveTup: 1200}, "1,000"},
+		{"analyzed zero rows", catalog.Table{EstRows: 0, LiveTup: 0}, "0"},
+		{"never analyzed: fall back to live tuples (~)", catalog.Table{EstRows: -1, LiveTup: 1000}, "~1,000"},
+		{"no stats at all", catalog.Table{EstRows: -1, LiveTup: 0}, "—"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tableRows(tc.row); got != tc.want {
+				t.Fatalf("tableRows(%+v) = %q, want %q", tc.row, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestActivityView_FullQuery(t *testing.T) {
 	// A query longer than the 60-rune table cap, with newlines to flatten.
 	long := "SELECT a, b, c\nFROM some_table\nWHERE col = 'a-fairly-long-literal-value' AND other_col > 100 ORDER BY a"

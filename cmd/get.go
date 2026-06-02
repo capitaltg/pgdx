@@ -56,11 +56,11 @@ func newGetRolesCmd() *cobra.Command {
 			"last-login history (you'd need log analysis or an audit extension for that).",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(context.Background())
+			defer release()
 			roles, err := catalog.ListRoles(context.Background(), conn)
 			if err != nil {
 				return err
@@ -148,12 +148,12 @@ func newGetDatabasesCmd() *cobra.Command {
 			"monitoring commit trickle).",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
 			ctx := context.Background()
-			defer conn.Close(ctx)
+			defer release()
 			switch sort {
 			case "name", "size":
 			default:
@@ -360,11 +360,11 @@ func newGetProgressCmd() *cobra.Command {
 		Short: "Show in-progress vacuum / create index / analyze / cluster operations",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(context.Background())
+			defer release()
 			ops, err := catalog.ListProgress(context.Background(), conn)
 			if err != nil {
 				return err
@@ -421,11 +421,11 @@ func newGetReplicationCmd() *cobra.Command {
 			"limit). Read-only.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(context.Background())
+			defer release()
 
 			if slots {
 				return runReplicationSlots(cmd, conn, format)
@@ -552,11 +552,11 @@ func newGetSettingsCmd() *cobra.Command {
 			"Give name substrings to filter (e.g. `get settings vacuum`), or --all for everything.",
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(context.Background())
+			defer release()
 			settings, err := catalog.ListSettings(context.Background(), conn, args, all)
 			if err != nil {
 				return err
@@ -608,12 +608,12 @@ func newGetConnectionsCmd() *cobra.Command {
 			"header and idle-in-tx watch always reflect the whole cluster.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
 			ctx := context.Background()
-			defer conn.Close(ctx)
+			defer release()
 			filter := catalog.ConnFilter{User: fUser, State: fState, App: fApp}
 
 			used, max, err := catalog.ConnUsage(ctx, conn)
@@ -759,12 +759,12 @@ func newGetExtensionsCmd() *cobra.Command {
 			"PG13+). That answers 'what CAN I enable here', not just what's already on. Read-only.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
 			ctx := context.Background()
-			defer conn.Close(ctx)
+			defer release()
 
 			if available {
 				avail, err := catalog.ListAvailableExtensions(ctx, conn)
@@ -853,18 +853,21 @@ func (v extensionsView) Rows() [][]string {
 	return out
 }
 
-// connectForGet handles the shared format-parse + default-context + connect dance.
-func connectForGet(cmd *cobra.Command) (render.Format, *db.Conn, error) {
+// connectForGet handles the shared format-parse + default-context + connect dance. It
+// returns a release func (call via defer) instead of having callers close the connection
+// directly: in a shell session the connection is shared and must NOT be closed per
+// command — release is a no-op there and closes a fresh connection otherwise.
+func connectForGet(cmd *cobra.Command) (render.Format, *db.Conn, func(), error) {
 	format, err := render.ParseFormat(flagOutput)
 	if err != nil {
-		return "", nil, usageError{err.Error()}
+		return "", nil, nil, usageError{err.Error()}
 	}
 	noteContext(cmd)
-	conn, err := db.Connect(context.Background(), flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
+	conn, release, err := dial(context.Background(), cmd, flagDatabase)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
-	return format, conn, nil
+	return format, conn, release, nil
 }
 
 func newGetViewsCmd() *cobra.Command {
@@ -874,11 +877,11 @@ func newGetViewsCmd() *cobra.Command {
 		Short: "List views and materialized views",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(context.Background())
+			defer release()
 			views, err := catalog.ListViews(context.Background(), conn, schema)
 			if err != nil {
 				return err
@@ -915,14 +918,19 @@ func newGetSequencesCmd() *cobra.Command {
 	var schema string
 	c := &cobra.Command{
 		Use:   "sequences",
-		Short: "List sequences with their last value",
-		Args:  cobra.NoArgs,
+		Short: "List sequences with their last value and how close they are to overflow",
+		Long: "sequences lists each sequence with its increment, current LAST-VALUE, the MAX-VALUE\n" +
+			"it can reach, and USED% (last/max). USED% is the early warning for sequence\n" +
+			"exhaustion — an int4 identity/serial column climbing toward 2,147,483,647 is a\n" +
+			"classic outage; catch it here and migrate the column to bigint before it wraps.\n" +
+			"USED% is shown only for ascending sequences. Read-only.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(context.Background())
+			defer release()
 			seqs, err := catalog.ListSequences(context.Background(), conn, schema)
 			if err != nil {
 				return err
@@ -947,10 +955,10 @@ func newGetSequencesCmd() *cobra.Command {
 type sequencesView []catalog.Sequence
 
 func (v sequencesView) Headers() []string {
-	return []string{"SCHEMA", "NAME", "TYPE", "INCREMENT", "LAST-VALUE"}
+	return []string{"SCHEMA", "NAME", "TYPE", "INCREMENT", "LAST-VALUE", "MAX-VALUE", "USED%"}
 }
 func (v sequencesView) Aligns() []render.Align {
-	return []render.Align{render.AlignLeft, render.AlignLeft, render.AlignLeft, render.AlignRight, render.AlignRight}
+	return []render.Align{render.AlignLeft, render.AlignLeft, render.AlignLeft, render.AlignRight, render.AlignRight, render.AlignRight, render.AlignRight}
 }
 func (v sequencesView) Rows() [][]string {
 	out := make([][]string, 0, len(v))
@@ -959,9 +967,27 @@ func (v sequencesView) Rows() [][]string {
 		if s.LastValue != nil {
 			last = withThousands(*s.LastValue)
 		}
-		out = append(out, []string{s.Schema, s.Name, s.DataType, withThousands(s.Increment), last})
+		out = append(out, []string{
+			s.Schema, s.Name, s.DataType, withThousands(s.Increment),
+			last, withThousands(s.MaxValue), seqUsedPct(s),
+		})
 	}
 	return out
+}
+
+// seqUsedPct is how much of an ascending sequence's range it has consumed
+// (last_value / max_value) — the signal for "this sequence is about to overflow", which
+// for an int4 column is a classic outage. "—" when it can't be judged: never used, a
+// descending sequence, or a non-positive ceiling.
+func seqUsedPct(s catalog.Sequence) string {
+	if s.LastValue == nil || s.Increment <= 0 || s.MaxValue <= 0 {
+		return "—"
+	}
+	pct := 100 * float64(*s.LastValue) / float64(s.MaxValue)
+	if pct > 0 && pct < 1 {
+		return "<1%" // don't round a barely-started sequence down to a misleading 0%
+	}
+	return fmt.Sprintf("%.0f%%", pct)
 }
 
 func newGetFunctionsCmd() *cobra.Command {
@@ -971,11 +997,11 @@ func newGetFunctionsCmd() *cobra.Command {
 		Short: "List functions and procedures",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(context.Background())
+			defer release()
 			fns, err := catalog.ListFunctions(context.Background(), conn, schema)
 			if err != nil {
 				return err
@@ -1016,11 +1042,11 @@ func newGetSchemasCmd() *cobra.Command {
 		Short: "List schemas with table counts",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(context.Background())
+			defer release()
 			schemas, err := catalog.ListSchemas(context.Background(), conn)
 			if err != nil {
 				return err
@@ -1098,11 +1124,11 @@ func newGetSlowQueriesCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
+			conn, release, err := dial(ctx, cmd, flagDatabase)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(ctx)
+			defer release()
 
 			// D3: degrade gracefully when the extension isn't present.
 			avail, err := catalog.PgStatStatementsAvailable(ctx, conn)
@@ -1249,11 +1275,11 @@ func newGetLocksCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
+			conn, release, err := dial(ctx, cmd, flagDatabase)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(ctx)
+			defer release()
 
 			waits, err := catalog.ListLockWaits(ctx, conn)
 			if err != nil {
@@ -1365,11 +1391,11 @@ func newGetActivityCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
+			conn, release, err := dial(ctx, cmd, flagDatabase)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(ctx)
+			defer release()
 
 			// D8: warn if this role can't see other sessions' query text.
 			if ok, perr := catalog.HasMonitorPrivilege(ctx, conn); perr == nil && !ok {
@@ -1550,6 +1576,10 @@ func newGetTablesCmd() *cobra.Command {
 		Long: "tables lists ordinary and partitioned tables across every non-system schema,\n" +
 			"with a SCHEMA column so nothing is hidden the way \\dt hides non-search_path\n" +
 			"schemas. Use --schema to narrow to one. Read-only; needs no special privilege.\n\n" +
+			"ROWS is the planner's estimate (from the last ANALYZE/VACUUM); for a table that has\n" +
+			"never been analyzed it falls back to the live-tuple count, shown as ~N. DEAD% stays\n" +
+			"blank when a table has no collected statistics at all (e.g. just after a restore or\n" +
+			"a stats reset) — run ANALYZE to populate both.\n\n" +
 			"--usage swaps the size/bloat columns for access patterns: sequential vs index\n" +
 			"scans (with IDX% — the share served by an index) and insert/update/delete counts,\n" +
 			"most sequentially-scanned first. A big, heavily seq-scanned table with a low IDX%\n" +
@@ -1563,11 +1593,11 @@ func newGetTablesCmd() *cobra.Command {
 
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
+			conn, release, err := dial(ctx, cmd, flagDatabase)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(ctx)
+			defer release()
 
 			if usage {
 				return runTableUsage(cmd, ctx, conn, schema, format)
@@ -1662,12 +1692,12 @@ func newGetBloatCmd() *cobra.Command {
 			"the OS. Tables with zero dead tuples are omitted. Read-only.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
 			ctx := context.Background()
-			defer conn.Close(ctx)
+			defer release()
 			rows, err := catalog.ListTableBloat(ctx, conn, schema, limit)
 			if err != nil {
 				return err
@@ -1732,12 +1762,12 @@ func newGetTransactionAgeCmd() *cobra.Command {
 			"Use --min to hide short transactions (e.g. --min 30s). Read-only.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
 			ctx := context.Background()
-			defer conn.Close(ctx)
+			defer release()
 			txns, err := catalog.ListLongTransactions(ctx, conn, min.Seconds())
 			if err != nil {
 				return err
@@ -1808,12 +1838,12 @@ func newGetVacuumHealthCmd() *cobra.Command {
 			"Read-only. Pair with `get transaction-age` when ages stay stubbornly high.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, conn, err := connectForGet(cmd)
+			format, conn, release, err := connectForGet(cmd)
 			if err != nil {
 				return err
 			}
 			ctx := context.Background()
-			defer conn.Close(ctx)
+			defer release()
 			rows, err := catalog.ListWraparoundRisk(ctx, conn, schema, limit)
 			if err != nil {
 				return err
@@ -1931,11 +1961,11 @@ func newGetIndexesCmd() *cobra.Command {
 			}
 			noteContext(cmd)
 			ctx := context.Background()
-			conn, err := db.Connect(ctx, flagDSN, flagTimeout, flagDatabase, sqlLog(cmd))
+			conn, release, err := dial(ctx, cmd, flagDatabase)
 			if err != nil {
 				return err
 			}
-			defer conn.Close(ctx)
+			defer release()
 
 			if redundant {
 				return runRedundantIndexes(cmd, ctx, conn, schema, table, format)
@@ -2088,13 +2118,26 @@ func (v tablesView) Aligns() []render.Align {
 func (v tablesView) Rows() [][]string {
 	out := make([][]string, 0, len(v))
 	for _, t := range v {
-		rows := "—" // never analyzed (reltuples = -1) reads as unknown, not "0"
-		if t.EstRows >= 0 {
-			rows = withThousands(t.EstRows) // table view only; JSON keeps the raw int
-		}
-		out = append(out, []string{t.Schema, t.Name, t.Owner, t.Size, rows, deadPct(t.LiveTup, t.DeadTup)})
+		out = append(out, []string{t.Schema, t.Name, t.Owner, t.Size, tableRows(t), deadPct(t.LiveTup, t.DeadTup)})
 	}
 	return out
+}
+
+// tableRows renders the ROWS cell. It prefers reltuples (the planner's estimate, set by
+// ANALYZE/VACUUM); when that's unavailable (-1 on a never-analyzed table, common right
+// after a restore) it falls back to the cumulative live-tuple count, marked "~" so it
+// reads as approximate-from-stats rather than the analyzed estimate. Only a table with
+// neither stays "—". JSON output is unaffected — it carries est_rows and live_tuples as
+// separate fields.
+func tableRows(t catalog.Table) string {
+	switch {
+	case t.EstRows >= 0:
+		return withThousands(t.EstRows)
+	case t.LiveTup > 0:
+		return "~" + withThousands(t.LiveTup)
+	default:
+		return "—"
+	}
 }
 
 // deadPct is the dead-tuple ratio for the table list; "—" when there are no stats.

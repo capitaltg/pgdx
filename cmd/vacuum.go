@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -32,8 +34,19 @@ func newVacuumCmd() *cobra.Command {
 			errOut := cmd.ErrOrStderr()
 			noteContext(cmd)
 			ctx := context.Background()
-			// Disable statement_timeout (D6's default would cancel a long VACUUM).
-			conn, err := db.Connect(ctx, flagDSN, "0", flagDatabase, sqlLog(cmd))
+			// VACUUM needs two things: the session's database (in a shell the per-command
+			// flags are reset, so re-resolving from flagDSN/flagDatabase would land on the
+			// wrong database and the table would appear "not found"), and no
+			// statement_timeout (D6's default would cancel a long VACUUM). In a shell, clone
+			// the session connection's resolved target with the timeout lifted; otherwise
+			// open a fresh connection the usual way.
+			var conn *db.Conn
+			var err error
+			if sharedConn != nil {
+				conn, err = sharedConn.ConnectWithoutTimeout(ctx)
+			} else {
+				conn, err = db.Connect(ctx, flagDSN, "0", flagDatabase, sqlLog(cmd))
+			}
 			if err != nil {
 				return err
 			}
@@ -59,10 +72,19 @@ func newVacuumCmd() *cobra.Command {
 
 			sql := vacuumSQL(quoteIdent(rt.Schema)+"."+quoteIdent(rt.Name), full, analyze)
 			fmt.Fprintf(errOut, "running: %s\n", sql)
+
+			before, _ := catalog.GetTableStats(ctx, conn, rt.OID) // best-effort baseline
+			start := time.Now()
 			if err := conn.Exec(ctx, sql); err != nil {
 				return err
 			}
-			fmt.Fprintf(errOut, "done. Re-check with: pgdx describe table %s.%s\n", rt.Schema, rt.Name)
+			elapsed := time.Since(start)
+
+			fmt.Fprintf(errOut, "done in %s.\n", fmtDuration(elapsed))
+			if after, err := catalog.GetTableStats(ctx, conn, rt.OID); err == nil {
+				reportVacuumOutcome(errOut, before, after, full)
+			}
+			fmt.Fprintf(errOut, "Re-check with: pgdx describe table %s.%s\n", rt.Schema, rt.Name)
 			return nil
 		},
 	}
@@ -70,6 +92,56 @@ func newVacuumCmd() *cobra.Command {
 	c.Flags().BoolVar(&full, "full", false, "VACUUM FULL — rewrites the table, ACCESS EXCLUSIVE lock (asks to confirm)")
 	c.Flags().BoolVar(&force, "force", false, "skip the --full confirmation prompt")
 	return c
+}
+
+// reportVacuumOutcome summarizes what the VACUUM changed.
+//
+// For VACUUM FULL the table is rewritten, so disk freed is the meaningful (and reliable)
+// signal — pg_stat's dead-tuple counter isn't updated promptly after a rewrite, so we do
+// NOT infer "reclaimed" from it here (doing so produced a bogus "nothing removable" line
+// even when the rewrite plainly shrank the table).
+//
+// For a plain VACUUM the dead-tuple delta is reliable: it reports how many were reclaimed,
+// and when dead tuples were present but none were removable it names the usual cause —
+// rows still visible to an open transaction or pinned by a replication slot — so a "done"
+// that didn't actually help explains itself. Plain VACUUM can also truncate trailing empty
+// pages, so any size freed is reported too.
+func reportVacuumOutcome(w io.Writer, before, after catalog.TableStats, full bool) {
+	if full {
+		if freed := before.SizeBytes - after.SizeBytes; freed > 0 {
+			fmt.Fprintf(w, "rewrote the table; size %s → %s (freed %s).\n",
+				humanBytes(before.SizeBytes), humanBytes(after.SizeBytes), humanBytes(freed))
+		} else {
+			fmt.Fprintf(w, "rewrote the table; size %s (nothing to reclaim).\n", humanBytes(after.SizeBytes))
+		}
+		return
+	}
+	switch reclaimed := before.DeadTup - after.DeadTup; {
+	case reclaimed > 0:
+		fmt.Fprintf(w, "reclaimed %s dead tuple%s (%s remaining).\n",
+			withThousands(reclaimed), plural(int(reclaimed)), withThousands(after.DeadTup))
+	case before.DeadTup > 0:
+		fmt.Fprintf(w, "%s dead tuple%s remain — none were removable. They're likely still visible to an\n"+
+			"open transaction or pinned by a replication slot; check `pgdx get transaction-age` and `pgdx status`.\n",
+			withThousands(after.DeadTup), plural(int(after.DeadTup)))
+	}
+	if freed := before.SizeBytes - after.SizeBytes; freed > 0 {
+		fmt.Fprintf(w, "size %s → %s (freed %s).\n",
+			humanBytes(before.SizeBytes), humanBytes(after.SizeBytes), humanBytes(freed))
+	}
+}
+
+// fmtDuration renders a VACUUM's elapsed time at a sensible precision: milliseconds under
+// a second, tenths under a minute, whole seconds beyond.
+func fmtDuration(d time.Duration) string {
+	switch {
+	case d < time.Second:
+		return d.Round(time.Millisecond).String()
+	case d < time.Minute:
+		return d.Round(100 * time.Millisecond).String()
+	default:
+		return d.Round(time.Second).String()
+	}
 }
 
 // vacuumSQL builds the statement. Options use the parenthesized form (PG9+).
