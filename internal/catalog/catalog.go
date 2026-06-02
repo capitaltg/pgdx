@@ -2938,24 +2938,58 @@ type TableStats struct {
 	LiveTup   int64 `json:"live_tuples"`
 	DeadTup   int64 `json:"dead_tuples"`
 	SizeBytes int64 `json:"size_bytes"` // pg_total_relation_size (heap + indexes + TOAST)
+	EstRows   int64 `json:"est_rows"`   // pg_class.reltuples (planner estimate); -1 = never analyzed
 }
 
-// GetTableStats reads a table's live/dead tuple counts (pg_stat_all_tables) and total
-// relation size by OID. Used around a VACUUM to compute tuples reclaimed and space freed.
+// GetTableStats reads a table's planner row estimate (pg_class.reltuples), live/dead tuple
+// counts (pg_stat_all_tables), and total relation size by OID. Used around a VACUUM to
+// compute tuples reclaimed and space freed, and after an ANALYZE to report the refreshed
+// row estimate.
 func GetTableStats(ctx context.Context, q Querier, oid uint32) (TableStats, error) {
 	var s TableStats
 	rows, err := q.Query(ctx, `SELECT COALESCE(st.n_live_tup, 0), COALESCE(st.n_dead_tup, 0),
-       pg_catalog.pg_total_relation_size($1)::bigint
-FROM (SELECT $1::oid AS oid) o
-LEFT JOIN pg_catalog.pg_stat_all_tables st ON st.relid = o.oid`, oid)
+       pg_catalog.pg_total_relation_size(c.oid)::bigint,
+       c.reltuples::bigint
+FROM pg_catalog.pg_class c
+LEFT JOIN pg_catalog.pg_stat_all_tables st ON st.relid = c.oid
+WHERE c.oid = $1`, oid)
 	if err != nil {
 		return s, err
 	}
 	defer rows.Close()
 	if rows.Next() {
-		if err := rows.Scan(&s.LiveTup, &s.DeadTup, &s.SizeBytes); err != nil {
+		if err := rows.Scan(&s.LiveTup, &s.DeadTup, &s.SizeBytes, &s.EstRows); err != nil {
 			return s, err
 		}
 	}
 	return s, rows.Err()
+}
+
+// CountTablesForAnalyze counts ordinary + partitioned tables in scope (a single schema, or
+// every non-system schema when schema is empty) and, of those, how many have never been
+// analyzed (reltuples < 0). It lets `pgdx analyze --all`/`--schema` report a concise
+// summary — "N tables, M had no prior statistics" — without enumerating every name.
+func CountTablesForAnalyze(ctx context.Context, q Querier, schema string) (total, missing int, err error) {
+	sql := `SELECT count(*), count(*) FILTER (WHERE c.reltuples < 0)
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'p')
+  AND n.nspname !~ '^pg_'
+  AND n.nspname <> 'information_schema'`
+	var args []any
+	if schema != "" {
+		args = append(args, schema)
+		sql += "\n  AND n.nspname = $1"
+	}
+	rows, err := q.Query(ctx, sql, args...)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		if err := rows.Scan(&total, &missing); err != nil {
+			return 0, 0, err
+		}
+	}
+	return total, missing, rows.Err()
 }

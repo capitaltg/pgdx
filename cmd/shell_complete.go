@@ -93,8 +93,8 @@ func flagItems(cmd *cobra.Command) []readline.PrefixCompleterInterface {
 func objectNameCompleter(cmd *cobra.Command) readline.PrefixCompleterInterface {
 	var kinds []string
 	switch {
-	case cmd.Name() == "vacuum":
-		kinds = []string{"r", "p", "m"} // VACUUM targets tables and materialized views
+	case cmd.Name() == "vacuum" || cmd.Name() == "analyze":
+		kinds = []string{"r", "p", "m"} // VACUUM/ANALYZE target tables and materialized views
 	case cmd.Parent() != nil && cmd.Parent().Name() == "describe":
 		switch cmd.Name() {
 		case "table":

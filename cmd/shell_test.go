@@ -74,18 +74,21 @@ func TestCompleterCommandTree(t *testing.T) {
 		}
 	}
 
-	// vacuum offers dynamic table-name completion (Tier 2) too.
-	if vac, ok := top["vacuum"]; !ok {
-		t.Errorf("top-level completion missing %q", "vacuum")
-	} else {
+	// vacuum and analyze offer dynamic table-name completion (Tier 2) too.
+	for _, name := range []string{"vacuum", "analyze"} {
+		node, ok := top[name]
+		if !ok {
+			t.Errorf("top-level completion missing %q", name)
+			continue
+		}
 		hasDynamic := false
-		for _, c := range vac.GetChildren() {
+		for _, c := range node.GetChildren() {
 			if pc, ok := c.(*readline.PrefixCompleter); ok && pc.IsDynamic() {
 				hasDynamic = true
 			}
 		}
 		if !hasDynamic {
-			t.Errorf("vacuum completion should have a dynamic table-name completer")
+			t.Errorf("%s completion should have a dynamic table-name completer", name)
 		}
 	}
 
