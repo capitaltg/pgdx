@@ -2806,6 +2806,189 @@ func ListTables(ctx context.Context, q Querier, schema string) ([]Table, error) 
 	return out, rows.Err()
 }
 
+// SchemaGraphColumn is one column in a SchemaGraph table, carrying just the facts an ER
+// diagram needs: its type, nullability, and which keys it participates in.
+type SchemaGraphColumn struct {
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Nullable bool   `json:"nullable"`
+	IsPK     bool   `json:"is_pk"`
+	IsFK     bool   `json:"is_fk"`
+	IsUnique bool   `json:"is_unique"`
+}
+
+// SchemaGraphTable is one table (entity) in a SchemaGraph.
+type SchemaGraphTable struct {
+	Schema  string              `json:"schema"`
+	Name    string              `json:"name"`
+	Columns []SchemaGraphColumn `json:"columns"`
+}
+
+// SchemaGraphEdge is one foreign-key relationship: the From table references the To
+// table (From holds the FK and is the "many" side; To is the referenced "one" side).
+type SchemaGraphEdge struct {
+	FromSchema string `json:"from_schema"`
+	FromTable  string `json:"from_table"`
+	ToSchema   string `json:"to_schema"`
+	ToTable    string `json:"to_table"`
+	Constraint string `json:"constraint"`
+}
+
+// SchemaGraph is the table-and-relationship view of a schema (or the whole database when
+// schema is empty): every table with its columns and key roles, plus every foreign-key
+// edge between them. It backs `get tables -o mermaid`.
+type SchemaGraph struct {
+	Tables []SchemaGraphTable `json:"tables"`
+	Edges  []SchemaGraphEdge  `json:"edges"`
+}
+
+// BuildSchemaGraph gathers every table's columns (with PK/FK/unique roles) and every
+// foreign-key edge in one pass — three set-based catalog queries, not N per-table calls,
+// so it stays cheap on large schemas. schema="" spans all non-system schemas.
+func BuildSchemaGraph(ctx context.Context, q Querier, schema string) (*SchemaGraph, error) {
+	schemaFilter := func(col string) (string, []any) {
+		if schema == "" {
+			return "", nil
+		}
+		return "\n  AND " + col + " = $1", []any{schema}
+	}
+
+	// 1. Columns of every in-scope table, in ordinal order.
+	colWhere, colArgs := schemaFilter("n.nspname")
+	colSQL := `SELECT n.nspname, c.relname, a.attname,
+       pg_catalog.format_type(a.atttypid, a.atttypmod) AS type,
+       a.attnotnull
+FROM pg_catalog.pg_attribute a
+JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'p')
+  AND a.attnum > 0 AND NOT a.attisdropped
+  AND n.nspname !~ '^pg_'
+  AND n.nspname <> 'information_schema'` + colWhere + `
+ORDER BY n.nspname, c.relname, a.attnum`
+
+	rows, err := q.Query(ctx, colSQL, colArgs...)
+	if err != nil {
+		return nil, err
+	}
+	// tableKey -> index into tables slice, preserving first-seen (query) order.
+	idx := map[string]int{}
+	var tables []SchemaGraphTable
+	colAt := map[string]int{} // "schema.table\x00col" -> column index, for marking key roles
+	for rows.Next() {
+		var sch, tbl, col, typ string
+		var notNull bool
+		if err := rows.Scan(&sch, &tbl, &col, &typ, &notNull); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		tk := sch + "." + tbl
+		i, ok := idx[tk]
+		if !ok {
+			i = len(tables)
+			idx[tk] = i
+			tables = append(tables, SchemaGraphTable{Schema: sch, Name: tbl})
+		}
+		colAt[tk+"\x00"+col] = len(tables[i].Columns)
+		tables[i].Columns = append(tables[i].Columns, SchemaGraphColumn{Name: col, Type: typ, Nullable: !notNull})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	mark := func(sch, tbl, col string, f func(*SchemaGraphColumn)) {
+		ti, ok := idx[sch+"."+tbl]
+		if !ok {
+			return
+		}
+		ci, ok := colAt[sch+"."+tbl+"\x00"+col]
+		if !ok {
+			return
+		}
+		f(&tables[ti].Columns[ci])
+	}
+
+	// 2. Primary-key and unique columns, so we can tag them.
+	keyWhere, keyArgs := schemaFilter("n.nspname")
+	keySQL := `SELECT n.nspname, c.relname, a.attname, con.contype::text
+FROM pg_catalog.pg_constraint con
+JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = ANY(con.conkey)
+WHERE con.contype IN ('p', 'u')
+  AND n.nspname !~ '^pg_'
+  AND n.nspname <> 'information_schema'` + keyWhere
+	krows, err := q.Query(ctx, keySQL, keyArgs...)
+	if err != nil {
+		return nil, err
+	}
+	for krows.Next() {
+		var sch, tbl, col, ctype string
+		if err := krows.Scan(&sch, &tbl, &col, &ctype); err != nil {
+			krows.Close()
+			return nil, err
+		}
+		mark(sch, tbl, col, func(c *SchemaGraphColumn) {
+			if ctype == "p" {
+				c.IsPK = true
+			} else {
+				c.IsUnique = true
+			}
+		})
+	}
+	if err := krows.Err(); err != nil {
+		krows.Close()
+		return nil, err
+	}
+	krows.Close()
+
+	// 3. Foreign keys: one row per (constraint, referencing column) so we can both tag FK
+	// columns and build the edges. The edge is deduped by constraint name.
+	fkWhere, fkArgs := schemaFilter("n.nspname")
+	fkSQL := `SELECT n.nspname, c.relname, a.attname,
+       fn.nspname AS to_schema, fc.relname AS to_table, con.conname
+FROM pg_catalog.pg_constraint con
+JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_class fc ON fc.oid = con.confrelid
+JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace
+JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = ANY(con.conkey)
+WHERE con.contype = 'f'
+  AND n.nspname !~ '^pg_'
+  AND n.nspname <> 'information_schema'` + fkWhere + `
+ORDER BY n.nspname, c.relname, con.conname`
+	frows, err := q.Query(ctx, fkSQL, fkArgs...)
+	if err != nil {
+		return nil, err
+	}
+	var edges []SchemaGraphEdge
+	seenEdge := map[string]bool{}
+	for frows.Next() {
+		var sch, tbl, col, toSch, toTbl, conname string
+		if err := frows.Scan(&sch, &tbl, &col, &toSch, &toTbl, &conname); err != nil {
+			frows.Close()
+			return nil, err
+		}
+		mark(sch, tbl, col, func(c *SchemaGraphColumn) { c.IsFK = true })
+		ek := sch + "." + tbl + "\x00" + conname
+		if !seenEdge[ek] {
+			seenEdge[ek] = true
+			edges = append(edges, SchemaGraphEdge{
+				FromSchema: sch, FromTable: tbl, ToSchema: toSch, ToTable: toTbl, Constraint: conname,
+			})
+		}
+	}
+	if err := frows.Err(); err != nil {
+		frows.Close()
+		return nil, err
+	}
+	frows.Close()
+
+	return &SchemaGraph{Tables: tables, Edges: edges}, nil
+}
+
 // RelationName is a schema-qualified relation name. It is intentionally minimal (no
 // stats or sizes) so the shell's tab-completion can list candidate names on a single
 // keypress without paying the cost of the full get/describe queries.

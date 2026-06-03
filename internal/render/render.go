@@ -18,10 +18,11 @@ import (
 type Format string
 
 const (
-	FormatTable Format = "table" // default, human-readable
-	FormatJSON  Format = "json"  // machine-readable, jq-clean
-	FormatYAML  Format = "yaml"  // deferred (D-direction): not yet supported
-	FormatWide  Format = "wide"  // deferred: not yet supported
+	FormatTable   Format = "table"   // default, human-readable
+	FormatJSON    Format = "json"    // machine-readable, jq-clean
+	FormatMermaid Format = "mermaid" // ER diagram; only `describe table` supports it
+	FormatYAML    Format = "yaml"    // deferred (D-direction): not yet supported
+	FormatWide    Format = "wide"    // deferred: not yet supported
 )
 
 // ParseFormat validates a -o value.

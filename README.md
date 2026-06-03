@@ -248,6 +248,7 @@ diagnosis. Handy for a plan pulled from a slow-query log, `auto_explain`, or a c
 ```bash
 pgdx get tables [--schema S]          # tables: size, est rows, DEAD% (bloat)
 pgdx get tables --usage               # read/write patterns: seq vs index scans (IDX%), ins/upd/del
+pgdx get tables -o mermaid            # schema ER diagram: tables + FK relationships (--all-columns for every column)
 pgdx get indexes [--table T] [--unused]  # indexes + scan counts; --unused = drop candidates
 pgdx get indexes --sort size          # order by index size (biggest first); also --sort scans | name
 pgdx get indexes --redundant          # indexes covered by another (duplicate or prefix) — safe drops
@@ -263,6 +264,7 @@ pgdx get settings [name...] [--all]   # server config (curated subset by default
 
 pgdx describe table <name>            # columns, indexes, constraints, incoming FKs, partitions, bloat
 pgdx describe table <name> --stats    # + per-column planner stats (n_distinct, null frac, correlation)
+pgdx describe table <name> -o mermaid # ER diagram: columns + keys + FK relationships
 pgdx describe index <name>            # method, validity, usage, definition
 pgdx describe view <name>             # columns + definition
 
@@ -395,6 +397,19 @@ Data goes to stdout, warnings/errors to stderr, so pipelines stay clean:
 
 ```bash
 pgdx get indexes -o json | jq '.[] | select(.scans == 0 and .unique == false)'
+```
+
+`describe table` and `get tables` additionally support `-o mermaid`, which emits a Mermaid
+`erDiagram`. For `describe table` it's one table — its columns (with `PK`/`FK`/`UK` tags and
+nullability) plus its outgoing and incoming foreign-key relationships. For `get tables` it's
+the whole schema — every table and the foreign keys between them, showing only key columns by
+default (`--all-columns` for every column; pair with `--schema` on a big database to keep it
+readable). Paste the output into [mermaid.live](https://mermaid.live) or a `mermaid` fenced
+block, or pipe it straight to an image:
+
+```bash
+pgdx describe table orders -o mermaid | mmdc -i - -o orders.svg
+pgdx get tables --schema public -o mermaid | mmdc -i - -o schema.svg
 ```
 
 **See the SQL:** the global `--sql` flag prints every query pgdx runs (to stderr — so it

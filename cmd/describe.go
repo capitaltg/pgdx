@@ -3,6 +3,9 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
+	"regexp"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -97,9 +100,16 @@ func newDescribeTableCmd() *cobra.Command {
 			"users may get fewer rows.)",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			format, err := render.ParseFormat(flagOutput)
-			if err != nil {
-				return usageError{err.Error()}
+			// describe table additionally supports -o mermaid (an entity-relationship
+			// diagram); other commands only do table/json, so we accept it here rather
+			// than widening render.ParseFormat.
+			format := render.Format(flagOutput)
+			if format != render.FormatMermaid {
+				var err error
+				format, err = render.ParseFormat(flagOutput)
+				if err != nil {
+					return usageError{err.Error()}
+				}
 			}
 			noteContext(cmd)
 			ctx := context.Background()
@@ -121,10 +131,14 @@ func newDescribeTableCmd() *cobra.Command {
 				detail.ColumnStats = cs
 			}
 
-			if format == render.FormatJSON {
+			switch format {
+			case render.FormatJSON:
 				return render.Render(cmd.OutOrStdout(), format, detail)
+			case render.FormatMermaid:
+				return renderTableMermaid(cmd.OutOrStdout(), detail)
+			default:
+				return renderTableDetail(cmd, detail, stats)
 			}
-			return renderTableDetail(cmd, detail, stats)
 		},
 	}
 	c.Flags().BoolVar(&stats, "stats", false, "include per-column planner statistics from pg_stats (n_distinct, null frac, correlation)")
@@ -213,6 +227,193 @@ func orNever(s string) string {
 		return "never"
 	}
 	return s
+}
+
+// fkDefRe pulls the pieces out of a pg_get_constraintdef foreign-key definition:
+//
+//	FOREIGN KEY (a, b) REFERENCES schema.other(x, y)
+//
+// group 1 = local columns, group 2 = referenced table, group 3 = referenced columns.
+var fkDefRe = regexp.MustCompile(`(?is)FOREIGN KEY\s*\(([^)]*)\)\s*REFERENCES\s+([^\s(]+)\s*\(([^)]*)\)`)
+
+// parenColsRe grabs the first parenthesized column list, e.g. PRIMARY KEY (id).
+var parenColsRe = regexp.MustCompile(`\(([^)]*)\)`)
+
+// renderTableMermaid emits a Mermaid erDiagram for one table: its columns (with
+// PK/FK/UK tags and nullability) plus its outgoing and incoming foreign-key
+// relationships. Stats, health, and partitioning are intentionally omitted — this is
+// a relationship diagram, not a full dump. Data → stdout (D4).
+func renderTableMermaid(w io.Writer, d *catalog.TableDetail) error {
+	self := mermaidEntity(d.Schema, d.Name)
+
+	// Build per-column key tags from the constraints.
+	tags := map[string][]string{}
+	addTag := func(cols []string, tag string) {
+		for _, c := range cols {
+			tags[c] = append(tags[c], tag)
+		}
+	}
+	for _, c := range d.Constraints {
+		switch c.Type {
+		case "primary key":
+			addTag(parseColList(c.Definition), "PK")
+		case "unique":
+			addTag(parseColList(c.Definition), "UK")
+		case "foreign key":
+			if m := fkDefRe.FindStringSubmatch(c.Definition); m != nil {
+				addTag(splitCols(m[1]), "FK")
+			}
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("erDiagram\n")
+
+	// Focal entity with full column detail.
+	fmt.Fprintf(&b, "    %s {\n", self)
+	for _, col := range d.Columns {
+		line := fmt.Sprintf("        %s %s", mermaidType(col.Type), mermaidIdent(col.Name))
+		if t := tags[col.Name]; len(t) > 0 {
+			line += " " + strings.Join(t, ",")
+		}
+		nullable := "not null"
+		if col.Nullable {
+			nullable = "null"
+		}
+		line += fmt.Sprintf(" %q", nullable)
+		b.WriteString(line + "\n")
+	}
+	b.WriteString("    }\n")
+
+	// Outgoing FKs: this table references a parent. parent ||--o{ self.
+	for _, c := range d.Constraints {
+		if c.Type != "foreign key" {
+			continue
+		}
+		m := fkDefRe.FindStringSubmatch(c.Definition)
+		if m == nil {
+			continue
+		}
+		parent := mermaidEntity(catalog.SplitQualified(m[2]))
+		fmt.Fprintf(&b, "    %s ||--o{ %s : %q\n", parent, self, c.Name)
+	}
+
+	// Incoming FKs: another table references this one. self ||--o{ child.
+	for _, r := range d.ReferencedBy {
+		child := mermaidEntity(r.Schema, r.Table)
+		fmt.Fprintf(&b, "    %s ||--o{ %s : %q\n", self, child, r.Constraint)
+	}
+
+	_, err := io.WriteString(w, b.String())
+	return err
+}
+
+// renderSchemaMermaid emits a Mermaid erDiagram for a whole schema: every table as an
+// entity and every foreign key as a relationship edge. With allColumns=false (the
+// default) each entity shows only its key columns (PK/FK/unique) to stay readable on
+// large schemas; allColumns=true shows every column. Data → stdout (D4).
+func renderSchemaMermaid(w io.Writer, g *catalog.SchemaGraph, allColumns bool) error {
+	var b strings.Builder
+	b.WriteString("erDiagram\n")
+
+	for _, t := range g.Tables {
+		entity := mermaidEntity(t.Schema, t.Name)
+		var lines []string
+		for _, col := range t.Columns {
+			if !allColumns && !col.IsPK && !col.IsFK && !col.IsUnique {
+				continue // key-columns-only mode
+			}
+			var keys []string
+			if col.IsPK {
+				keys = append(keys, "PK")
+			}
+			if col.IsFK {
+				keys = append(keys, "FK")
+			}
+			if col.IsUnique {
+				keys = append(keys, "UK")
+			}
+			line := fmt.Sprintf("        %s %s", mermaidType(col.Type), mermaidIdent(col.Name))
+			if len(keys) > 0 {
+				line += " " + strings.Join(keys, ",")
+			}
+			nullable := "not null"
+			if col.Nullable {
+				nullable = "null"
+			}
+			line += fmt.Sprintf(" %q", nullable)
+			lines = append(lines, line)
+		}
+		// A table with no displayed columns (key-only mode, no keys) is emitted as a bare
+		// entity name — an empty "{ }" block trips some Mermaid renderers.
+		if len(lines) == 0 {
+			fmt.Fprintf(&b, "    %s\n", entity)
+			continue
+		}
+		fmt.Fprintf(&b, "    %s {\n", entity)
+		for _, l := range lines {
+			b.WriteString(l + "\n")
+		}
+		b.WriteString("    }\n")
+	}
+
+	for _, e := range g.Edges {
+		// parent (referenced, "one") ||--o{ child (FK holder, "many").
+		parent := mermaidEntity(e.ToSchema, e.ToTable)
+		child := mermaidEntity(e.FromSchema, e.FromTable)
+		fmt.Fprintf(&b, "    %s ||--o{ %s : %q\n", parent, child, e.Constraint)
+	}
+
+	_, err := io.WriteString(w, b.String())
+	return err
+}
+
+// parseColList returns the columns of the first parenthesized list in a constraint
+// definition, e.g. "PRIMARY KEY (a, b)" -> ["a","b"].
+func parseColList(def string) []string {
+	m := parenColsRe.FindStringSubmatch(def)
+	if m == nil {
+		return nil
+	}
+	return splitCols(m[1])
+}
+
+func splitCols(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if c := strings.TrimSpace(p); c != "" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// nonIdentRe matches any run of characters Mermaid won't accept in an identifier.
+var nonIdentRe = regexp.MustCompile(`[^A-Za-z0-9_]+`)
+
+// mermaidEntity is a diagram-safe entity name; the public schema is dropped, other
+// schemas are folded in with an underscore (public.orders -> orders, app.users ->
+// app_users).
+func mermaidEntity(schema, name string) string {
+	if schema != "" && schema != "public" {
+		return mermaidIdent(schema + "_" + name)
+	}
+	return mermaidIdent(name)
+}
+
+func mermaidIdent(s string) string {
+	s = nonIdentRe.ReplaceAllString(s, "_")
+	return strings.Trim(s, "_")
+}
+
+// mermaidType folds a Postgres type into a single token Mermaid will accept as an
+// attribute type ("character varying(255)" -> "character_varying_255").
+func mermaidType(t string) string {
+	if s := mermaidIdent(t); s != "" {
+		return s
+	}
+	return "unknown"
 }
 
 type partitionsView []catalog.Partition
