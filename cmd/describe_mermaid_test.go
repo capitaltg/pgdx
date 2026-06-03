@@ -40,7 +40,7 @@ func TestRenderTableMermaid(t *testing.T) {
 		"        bigint customer_id FK \"not null\"",
 		"        character_varying_255 email UK \"null\"", // type folded to one token
 		"        numeric_10_2 total \"null\"",
-		"    customers ||--o{ orders : \"orders_customer_id_fkey\"", // outgoing FK
+		"    customers ||--o{ orders : \"orders_customer_id_fkey\"",     // outgoing FK
 		"    orders ||--o{ order_items : \"order_items_order_id_fkey\"", // incoming FK
 	}
 	for _, w := range want {

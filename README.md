@@ -361,6 +361,43 @@ snapshots) is treated as fresh accumulation, not a misleading negative. Snapshot
 under `$PGDX_STATE_DIR` (default `~/.local/state/pgdx/snapshots`). Read-only against the
 database — `snapshot` only writes a local file.
 
+### Security
+
+```bash
+pgdx audit                            # security hardening checks, grouped by severity
+pgdx audit -o json                    # structured findings (check id, severity, remediation)
+pgdx audit --exit-code                # exit 1 if any warning/critical finding (CI gating)
+```
+
+`audit` runs read-only hardening checks and reports findings by severity, each with a
+one-line fix:
+
+- login roles with SUPERUSER or BYPASSRLS
+- login roles holding a "superuser-lite" predefined role — `pg_execute_server_program`
+  (shell access via `COPY ... PROGRAM`) or `pg_read_server_files`/`pg_write_server_files`
+  (critical), and `pg_read_all_data`/`pg_write_all_data` (warning); membership is checked
+  transitively, so inheritance through a group is caught
+- any schema (public or application) that grants CREATE to PUBLIC
+- tables with row-level-security policies defined but RLS not enabled (the policies silently
+  do nothing)
+- `password_encryption` on md5 instead of scram-sha-256
+- server SSL/TLS off, and whether *this* pgdx connection is actually encrypted
+- `pg_hba.conf` rules using `trust` (no password, critical), cleartext `password`, or weak
+  `md5` auth
+- installed untrusted procedural languages (`plpython3u`, `plperlu`, …)
+- connection audit logging (`log_connections`/`log_disconnections`) off (info)
+
+The bootstrap superuser and cloud-provider-managed superusers (AWS RDS's `rdsadmin`, GCP
+Cloud SQL's `cloudsqladmin`, Azure's `azuresu`) are reported at **info**, not warning — they
+are expected and, on a managed service, not something you can change. The warning is
+reserved for superuser roles *you* created.
+
+These are hygiene checks, not a compliance audit. pgdx connects as a client, so it can't
+read `postgresql.conf` and needs superuser (or `pg_read_all_settings`) to read
+`pg_hba.conf` — a check it can't run is reported as **skipped** rather than silently
+passed. `--exit-code` returns non-zero when a warning or critical finding is present, so it
+can gate CI; the default always exits 0 on a successful audit.
+
 ### Maintenance (write)
 
 ```bash

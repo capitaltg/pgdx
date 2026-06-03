@@ -3,7 +3,8 @@
 // The root command owns the persistent flags, the output-format flag, and the
 // stdout/stderr contract; each subcommand (explain, status, summarize, get,
 // describe, query, snapshot, diff, vacuum, cancel, kill, config) is built by its
-// own newXxxCmd constructor and registered in newRootCmd.
+// own newXxxCmd constructor and registered in newRootCmd. `audit` adds read-only
+// security hardening checks.
 package cmd
 
 import (
@@ -116,6 +117,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newDiffCmd())
 	root.AddCommand(newVacuumCmd())
 	root.AddCommand(newAnalyzeCmd())
+	root.AddCommand(newAuditCmd())
 	root.AddCommand(newCancelCmd())
 	root.AddCommand(newKillCmd())
 	root.AddCommand(newConfigCmd())
@@ -129,7 +131,9 @@ func newRootCmd() *cobra.Command {
 func Execute() int {
 	root := newRootCmd()
 	if err := root.Execute(); err != nil {
-		fmt.Fprintln(root.ErrOrStderr(), "error:", err)
+		if msg := err.Error(); msg != "" { // quietExit carries a code with no message
+			fmt.Fprintln(root.ErrOrStderr(), "error:", msg)
+		}
 		if ec, ok := err.(exitCoder); ok {
 			return ec.ExitCode()
 		}
