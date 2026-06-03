@@ -1570,6 +1570,7 @@ func compactQuery(s string, max int) string {
 func newGetTablesCmd() *cobra.Command {
 	var schema string
 	var usage bool
+	var allColumns bool
 	c := &cobra.Command{
 		Use:   "tables",
 		Short: "List tables (all non-system schemas by default)",
@@ -1583,12 +1584,22 @@ func newGetTablesCmd() *cobra.Command {
 			"--usage swaps the size/bloat columns for access patterns: sequential vs index\n" +
 			"scans (with IDX% — the share served by an index) and insert/update/delete counts,\n" +
 			"most sequentially-scanned first. A big, heavily seq-scanned table with a low IDX%\n" +
-			"is a prime candidate for a better index.",
+			"is a prime candidate for a better index.\n\n" +
+			"-o mermaid emits an entity-relationship diagram of the schema: every table and the\n" +
+			"foreign keys between them. By default each table shows only its key columns (PK/FK/\n" +
+			"unique); add --all-columns for every column. Pair with --schema on a large database\n" +
+			"to keep the diagram readable.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			format, err := render.ParseFormat(flagOutput)
-			if err != nil {
-				return usageError{err.Error()}
+			// get tables additionally supports -o mermaid (a schema ER diagram); accept it
+			// here rather than widening render.ParseFormat, which all commands share.
+			format := render.Format(flagOutput)
+			if format != render.FormatMermaid {
+				var err error
+				format, err = render.ParseFormat(flagOutput)
+				if err != nil {
+					return usageError{err.Error()}
+				}
 			}
 
 			noteContext(cmd)
@@ -1598,6 +1609,14 @@ func newGetTablesCmd() *cobra.Command {
 				return err
 			}
 			defer release()
+
+			if format == render.FormatMermaid {
+				graph, err := catalog.BuildSchemaGraph(ctx, conn, schema)
+				if err != nil {
+					return err
+				}
+				return renderSchemaMermaid(cmd.OutOrStdout(), graph, allColumns)
+			}
 
 			if usage {
 				return runTableUsage(cmd, ctx, conn, schema, format)
@@ -1628,6 +1647,7 @@ func newGetTablesCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&schema, "schema", "", "limit to a single schema (default: all non-system schemas)")
 	c.Flags().BoolVar(&usage, "usage", false, "show read/write access patterns (seq vs index scans, ins/upd/del) instead of size")
+	c.Flags().BoolVar(&allColumns, "all-columns", false, "with -o mermaid, show every column (default: key columns only)")
 	return c
 }
 

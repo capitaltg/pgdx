@@ -248,6 +248,7 @@ diagnosis. Handy for a plan pulled from a slow-query log, `auto_explain`, or a c
 ```bash
 pgdx get tables [--schema S]          # tables: size, est rows, DEAD% (bloat)
 pgdx get tables --usage               # read/write patterns: seq vs index scans (IDX%), ins/upd/del
+pgdx get tables -o mermaid            # schema ER diagram: tables + FK relationships (--all-columns for every column)
 pgdx get indexes [--table T] [--unused]  # indexes + scan counts; --unused = drop candidates
 pgdx get indexes --sort size          # order by index size (biggest first); also --sort scans | name
 pgdx get indexes --redundant          # indexes covered by another (duplicate or prefix) — safe drops
@@ -263,6 +264,7 @@ pgdx get settings [name...] [--all]   # server config (curated subset by default
 
 pgdx describe table <name>            # columns, indexes, constraints, incoming FKs, partitions, bloat
 pgdx describe table <name> --stats    # + per-column planner stats (n_distinct, null frac, correlation)
+pgdx describe table <name> -o mermaid # ER diagram: columns + keys + FK relationships
 pgdx describe index <name>            # method, validity, usage, definition
 pgdx describe view <name>             # columns + definition
 
@@ -359,6 +361,43 @@ snapshots) is treated as fresh accumulation, not a misleading negative. Snapshot
 under `$PGDX_STATE_DIR` (default `~/.local/state/pgdx/snapshots`). Read-only against the
 database — `snapshot` only writes a local file.
 
+### Security
+
+```bash
+pgdx audit                            # security hardening checks, grouped by severity
+pgdx audit -o json                    # structured findings (check id, severity, remediation)
+pgdx audit --exit-code                # exit 1 if any warning/critical finding (CI gating)
+```
+
+`audit` runs read-only hardening checks and reports findings by severity, each with a
+one-line fix:
+
+- login roles with SUPERUSER or BYPASSRLS
+- login roles holding a "superuser-lite" predefined role — `pg_execute_server_program`
+  (shell access via `COPY ... PROGRAM`) or `pg_read_server_files`/`pg_write_server_files`
+  (critical), and `pg_read_all_data`/`pg_write_all_data` (warning); membership is checked
+  transitively, so inheritance through a group is caught
+- any schema (public or application) that grants CREATE to PUBLIC
+- tables with row-level-security policies defined but RLS not enabled (the policies silently
+  do nothing)
+- `password_encryption` on md5 instead of scram-sha-256
+- server SSL/TLS off, and whether *this* pgdx connection is actually encrypted
+- `pg_hba.conf` rules using `trust` (no password, critical), cleartext `password`, or weak
+  `md5` auth
+- installed untrusted procedural languages (`plpython3u`, `plperlu`, …)
+- connection audit logging (`log_connections`/`log_disconnections`) off (info)
+
+The bootstrap superuser and cloud-provider-managed superusers (AWS RDS's `rdsadmin`, GCP
+Cloud SQL's `cloudsqladmin`, Azure's `azuresu`) are reported at **info**, not warning — they
+are expected and, on a managed service, not something you can change. The warning is
+reserved for superuser roles *you* created.
+
+These are hygiene checks, not a compliance audit. pgdx connects as a client, so it can't
+read `postgresql.conf` and needs superuser (or `pg_read_all_settings`) to read
+`pg_hba.conf` — a check it can't run is reported as **skipped** rather than silently
+passed. `--exit-code` returns non-zero when a warning or critical finding is present, so it
+can gate CI; the default always exits 0 on a successful audit.
+
 ### Maintenance (write)
 
 ```bash
@@ -395,6 +434,19 @@ Data goes to stdout, warnings/errors to stderr, so pipelines stay clean:
 
 ```bash
 pgdx get indexes -o json | jq '.[] | select(.scans == 0 and .unique == false)'
+```
+
+`describe table` and `get tables` additionally support `-o mermaid`, which emits a Mermaid
+`erDiagram`. For `describe table` it's one table — its columns (with `PK`/`FK`/`UK` tags and
+nullability) plus its outgoing and incoming foreign-key relationships. For `get tables` it's
+the whole schema — every table and the foreign keys between them, showing only key columns by
+default (`--all-columns` for every column; pair with `--schema` on a big database to keep it
+readable). Paste the output into [mermaid.live](https://mermaid.live) or a `mermaid` fenced
+block, or pipe it straight to an image:
+
+```bash
+pgdx describe table orders -o mermaid | mmdc -i - -o orders.svg
+pgdx get tables --schema public -o mermaid | mmdc -i - -o schema.svg
 ```
 
 **See the SQL:** the global `--sql` flag prints every query pgdx runs (to stderr — so it
