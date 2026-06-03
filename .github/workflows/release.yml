@@ -1,0 +1,111 @@
+name: Release
+
+# Cut a release by pushing a semver tag, e.g.:
+#   git tag v1.2.3 && git push origin v1.2.3
+# This cross-compiles pgdx for Linux/macOS/Windows, stamps the tag into the
+# binary (so `pgdx --version` reports it), and publishes the archives plus a
+# checksums file to a GitHub Release. The Docker job in ci.yml separately
+# pushes a semver-tagged image for the same tag.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build and archive
+        # Stamp the tag (github.ref_name, e.g. "v1.2.3") into cmd.version via
+        # -ldflags, matching the Makefile/Dockerfile target. -s -w strips the
+        # symbol table and DWARF info to shrink the binary. Each target is
+        # packaged as tar.gz (Unix) or zip (Windows) alongside LICENSE/README.
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          bin=pgdx
+          [ "$GOOS" = windows ] && bin=pgdx.exe
+
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X github.com/capitaltg/pgdx/cmd.version=${VERSION}" \
+            -o "$bin" .
+
+          name="pgdx_${VERSION}_${GOOS}_${GOARCH}"
+          mkdir -p "dist/${name}"
+          cp "$bin" LICENSE README.md "dist/${name}/"
+
+          cd dist
+          if [ "$GOOS" = windows ]; then
+            zip -r "${name}.zip" "${name}"
+          else
+            tar -czf "${name}.tar.gz" "${name}"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgdx_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to create the release and upload assets.
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz *.zip > "pgdx_${{ github.ref_name }}_checksums.txt"
+          cat "pgdx_${{ github.ref_name }}_checksums.txt"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Mark pre-release tags (e.g. v1.2.3-rc1) automatically.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*_checksums.txt

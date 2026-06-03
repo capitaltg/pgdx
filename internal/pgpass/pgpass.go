@@ -1,5 +1,5 @@
-// Package pgpass writes ~/.pgpass entries the way libpq expects, so psql and pgdx
-// share one password store.
+// Package pgpass writes password-file entries the way libpq expects, so psql, pgdx,
+// and the pgx driver pgdx connects with all share one password store.
 //
 // Format (one entry per line): hostname:port:database:username:password
 // A literal ':' or '\' inside any field is backslash-escaped. libpq ignores the
@@ -12,13 +12,22 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
-// DefaultPath returns PGPASSFILE if set, else ~/.pgpass.
+// DefaultPath returns the password-file location, matching exactly where pgx
+// (and libpq) look when *reading* it — otherwise set-password writes a file the
+// connection can't find. PGPASSFILE wins on every platform. With it unset, the
+// path is %APPDATA%\postgresql\pgpass.conf on Windows and ~/.pgpass elsewhere.
 func DefaultPath() (string, error) {
 	if p := os.Getenv("PGPASSFILE"); p != "" {
 		return p, nil
+	}
+	if runtime.GOOS == "windows" {
+		// Mirror pgx's defaults_windows.go verbatim, including the empty-APPDATA
+		// degenerate case, so writer and reader never diverge.
+		return filepath.Join(os.Getenv("APPDATA"), "postgresql", "pgpass.conf"), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -142,6 +151,10 @@ func escapeField(s string) string {
 
 func atomicWrite0600(path string, data []byte) error {
 	dir := filepath.Dir(path)
+	// The parent may not exist yet — notably %APPDATA%\postgresql on Windows.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create parent dir: %w", err)
+	}
 	tmp, err := os.CreateTemp(dir, ".pgdx-pgpass-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
