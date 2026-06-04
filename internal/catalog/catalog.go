@@ -2174,6 +2174,71 @@ func ListSequences(ctx context.Context, q Querier, schema string) ([]Sequence, e
 	return out, rows.Err()
 }
 
+// SequenceDetail is the full property set of one sequence, enough to reconstruct its
+// CREATE SEQUENCE. Owner column dependency (OWNED BY) is intentionally not gathered — see
+// the DDL reference note.
+type SequenceDetail struct {
+	Schema    string `json:"schema"`
+	Name      string `json:"name"`
+	DataType  string `json:"data_type"`
+	Start     int64  `json:"start_value"`
+	Min       int64  `json:"min_value"`
+	Max       int64  `json:"max_value"`
+	Increment int64  `json:"increment_by"`
+	Cache     int64  `json:"cache_size"`
+	Cycle     bool   `json:"cycle"`
+	LastValue *int64 `json:"last_value"` // nil if never used
+}
+
+// DescribeSequence resolves a sequence (bare or schema.name) to its full property set. A
+// bare name matching multiple schemas returns *AmbiguousTableError (shared shape with
+// tables).
+func DescribeSequence(ctx context.Context, q Querier, qualified string) (*SequenceDetail, error) {
+	schema, name := SplitQualified(qualified)
+	sql := `SELECT schemaname, sequencename, data_type::text,
+       start_value, min_value, max_value, increment_by, cache_size, cycle, last_value
+FROM pg_catalog.pg_sequences
+WHERE sequencename = $1
+  AND schemaname !~ '^pg_'
+  AND schemaname <> 'information_schema'`
+	args := []any{name}
+	if schema != "" {
+		args = append(args, schema)
+		sql += fmt.Sprintf("\n  AND schemaname = $%d", len(args))
+	}
+	sql += "\nORDER BY schemaname"
+
+	rows, err := q.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	var matches []SequenceDetail
+	for rows.Next() {
+		var s SequenceDetail
+		if err := rows.Scan(&s.Schema, &s.Name, &s.DataType, &s.Start, &s.Min, &s.Max,
+			&s.Increment, &s.Cache, &s.Cycle, &s.LastValue); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		matches = append(matches, s)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	switch {
+	case len(matches) == 0:
+		return nil, fmt.Errorf("sequence %q not found", qualified)
+	case len(matches) > 1:
+		schemas := make([]string, len(matches))
+		for i, m := range matches {
+			schemas[i] = m.Schema
+		}
+		return nil, &AmbiguousTableError{Name: name, Schemas: schemas}
+	}
+	return &matches[0], nil
+}
+
 // ---- Functions / procedures ----
 
 type Function struct {
@@ -2218,6 +2283,75 @@ func ListFunctions(ctx context.Context, q Querier, schema string) ([]Function, e
 		out = append(out, f)
 	}
 	return out, rows.Err()
+}
+
+// FunctionOverload is one resolved function/procedure (a single pg_proc row). Functions
+// can be overloaded, so a name resolves to one or more of these. Definition is the full
+// pg_get_functiondef output; it's empty for aggregates and window functions, where that
+// builtin doesn't apply.
+type FunctionOverload struct {
+	Schema     string `json:"schema"`
+	Name       string `json:"name"`
+	Kind       string `json:"kind"` // func | proc | agg | window
+	Args       string `json:"args"`
+	Result     string `json:"result"`
+	Language   string `json:"language"`
+	Owner      string `json:"owner"`
+	Definition string `json:"definition,omitempty"`
+}
+
+// FunctionDetail groups every overload that a (possibly bare) name resolves to.
+type FunctionDetail struct {
+	Name      string             `json:"name"`
+	Overloads []FunctionOverload `json:"overloads"`
+}
+
+// DescribeFunction resolves a function/procedure name (bare or schema.name) to all of its
+// overloads, each carrying its CREATE OR REPLACE FUNCTION definition (via
+// pg_get_functiondef). The CASE guard skips that builtin for aggregate/window kinds, where
+// it raises an error rather than returning DDL.
+func DescribeFunction(ctx context.Context, q Querier, qualified string) (*FunctionDetail, error) {
+	schema, name := SplitQualified(qualified)
+	sql := `SELECT n.nspname, p.proname,
+       CASE p.prokind WHEN 'f' THEN 'func' WHEN 'p' THEN 'proc' WHEN 'a' THEN 'agg' WHEN 'w' THEN 'window' ELSE p.prokind::text END,
+       pg_catalog.pg_get_function_arguments(p.oid),
+       pg_catalog.pg_get_function_result(p.oid),
+       l.lanname,
+       pg_catalog.pg_get_userbyid(p.proowner),
+       CASE WHEN p.prokind IN ('f', 'p') THEN pg_catalog.pg_get_functiondef(p.oid) ELSE '' END
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+WHERE p.proname = $1
+  AND n.nspname !~ '^pg_'
+  AND n.nspname <> 'information_schema'`
+	args := []any{name}
+	if schema != "" {
+		args = append(args, schema)
+		sql += fmt.Sprintf("\n  AND n.nspname = $%d", len(args))
+	}
+	sql += "\nORDER BY n.nspname, p.proname, pg_catalog.pg_get_function_arguments(p.oid)"
+
+	rows, err := q.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var overloads []FunctionOverload
+	for rows.Next() {
+		var f FunctionOverload
+		if err := rows.Scan(&f.Schema, &f.Name, &f.Kind, &f.Args, &f.Result, &f.Language, &f.Owner, &f.Definition); err != nil {
+			return nil, err
+		}
+		overloads = append(overloads, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(overloads) == 0 {
+		return nil, fmt.Errorf("function %q not found", qualified)
+	}
+	return &FunctionDetail{Name: name, Overloads: overloads}, nil
 }
 
 // ---- Schemas ----

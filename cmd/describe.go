@@ -22,6 +22,8 @@ func newDescribeCmd() *cobra.Command {
 	c.AddCommand(newDescribeTableCmd())
 	c.AddCommand(newDescribeIndexCmd())
 	c.AddCommand(newDescribeViewCmd())
+	c.AddCommand(newDescribeFunctionCmd())
+	c.AddCommand(newDescribeSequenceCmd())
 	return c
 }
 
@@ -31,10 +33,13 @@ func newDescribeViewCmd() *cobra.Command {
 		Short: "Show a view's columns and definition",
 		Long: "view shows a view or materialized view: its columns, the SELECT definition, and\n" +
 			"(for materialized views) size and whether it's been populated. Accepts a bare name\n" +
-			"or schema.name. Read-only.",
+			"or schema.name. Read-only.\n\n" +
+			"-o ddl wraps the stored query in a runnable CREATE [OR REPLACE] VIEW (or CREATE\n" +
+			"MATERIALIZED VIEW ... WITH [NO] DATA). It's a reference, not a pg_dump replacement\n" +
+			"(omits ownership, grants, comments).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			format, err := render.ParseFormat(flagOutput)
+			format, err := parseFormatAllowingDDL(flagOutput)
 			if err != nil {
 				return usageError{err.Error()}
 			}
@@ -50,8 +55,11 @@ func newDescribeViewCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if format == render.FormatJSON {
+			switch format {
+			case render.FormatJSON:
 				return render.Render(cmd.OutOrStdout(), format, d)
+			case render.FormatDDL:
+				return renderViewDDL(cmd.OutOrStdout(), d)
 			}
 			return renderViewDetail(cmd, d)
 		},
@@ -97,14 +105,18 @@ func newDescribeTableCmd() *cobra.Command {
 			"fraction, correlation, average width). A wrong n_distinct or stale stats are a\n" +
 			"leading cause of the row-estimate blowups `pgdx explain` flags — this is where you\n" +
 			"confirm them. (pg_stats only exposes columns your role may see; non-privileged\n" +
-			"users may get fewer rows.)",
+			"users may get fewer rows.)\n\n" +
+			"-o mermaid emits an entity-relationship diagram; -o ddl emits a CREATE TABLE\n" +
+			"reference (columns, constraints, indexes, partition-by). The DDL is for reading\n" +
+			"and scaffolding — it omits identity/generated syntax, storage params, comments,\n" +
+			"ownership, and grants, so use pg_dump for backups and migrations.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// describe table additionally supports -o mermaid (an entity-relationship
-			// diagram); other commands only do table/json, so we accept it here rather
-			// than widening render.ParseFormat.
+			// diagram) and -o ddl (a CREATE TABLE reference); other commands only do
+			// table/json, so we accept these here rather than widening render.ParseFormat.
 			format := render.Format(flagOutput)
-			if format != render.FormatMermaid {
+			if format != render.FormatMermaid && format != render.FormatDDL {
 				var err error
 				format, err = render.ParseFormat(flagOutput)
 				if err != nil {
@@ -136,6 +148,8 @@ func newDescribeTableCmd() *cobra.Command {
 				return render.Render(cmd.OutOrStdout(), format, detail)
 			case render.FormatMermaid:
 				return renderTableMermaid(cmd.OutOrStdout(), detail)
+			case render.FormatDDL:
+				return renderTableDDL(cmd.OutOrStdout(), detail)
 			default:
 				return renderTableDetail(cmd, detail, stats)
 			}
@@ -438,10 +452,11 @@ func newDescribeIndexCmd() *cobra.Command {
 		Long: "index shows one index in detail: the table it's on, access method, uniqueness,\n" +
 			"size, scan/tuple usage, the full definition, and whether it's VALID (a failed\n" +
 			"CREATE INDEX CONCURRENTLY leaves an invalid index that queries silently ignore).\n" +
-			"Accepts a bare name or schema.name. Read-only.",
+			"Accepts a bare name or schema.name. Read-only.\n\n" +
+			"-o ddl emits the CREATE INDEX statement (exact, from pg_get_indexdef).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			format, err := render.ParseFormat(flagOutput)
+			format, err := parseFormatAllowingDDL(flagOutput)
 			if err != nil {
 				return usageError{err.Error()}
 			}
@@ -457,8 +472,11 @@ func newDescribeIndexCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if format == render.FormatJSON {
+			switch format {
+			case render.FormatJSON:
 				return render.Render(cmd.OutOrStdout(), format, d)
+			case render.FormatDDL:
+				return renderIndexDDL(cmd.OutOrStdout(), d)
 			}
 			return renderIndexDetail(cmd, d)
 		},
@@ -491,6 +509,124 @@ func renderIndexDetail(cmd *cobra.Command, d *catalog.IndexDetail) error {
 	fmt.Fprintln(out, "\nDefinition:")
 	fmt.Fprintf(out, "  %s\n", d.Definition)
 	return nil
+}
+
+func newDescribeFunctionCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "function <name>",
+		Short: "Show a function/procedure's overloads and source",
+		Long: "function shows every overload a name resolves to: its arguments, return type,\n" +
+			"language, and owner. Accepts a bare name or schema.name; a bare name is matched\n" +
+			"across all non-system schemas. Read-only.\n\n" +
+			"-o ddl emits the full CREATE OR REPLACE FUNCTION for each overload (from\n" +
+			"pg_get_functiondef). Aggregate and window functions have no such definition and are\n" +
+			"noted instead.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			format, err := parseFormatAllowingDDL(flagOutput)
+			if err != nil {
+				return usageError{err.Error()}
+			}
+			noteContext(cmd)
+			ctx := context.Background()
+			conn, release, err := dial(ctx, cmd, flagDatabase)
+			if err != nil {
+				return err
+			}
+			defer release()
+
+			d, err := catalog.DescribeFunction(ctx, conn, args[0])
+			if err != nil {
+				return err
+			}
+			switch format {
+			case render.FormatJSON:
+				return render.Render(cmd.OutOrStdout(), format, d)
+			case render.FormatDDL:
+				return renderFunctionDDL(cmd.OutOrStdout(), d)
+			}
+			out := cmd.OutOrStdout()
+			noun := "overload"
+			if len(d.Overloads) != 1 {
+				noun = "overloads"
+			}
+			fmt.Fprintf(out, "Function %q — %d %s\n\n", d.Name, len(d.Overloads), noun)
+			return render.Render(out, render.FormatTable, functionOverloadsView(d.Overloads))
+		},
+	}
+	return c
+}
+
+func newDescribeSequenceCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "sequence <name>",
+		Short: "Show a sequence's type, bounds, increment, and current value",
+		Long: "sequence shows one sequence: data type, start, min/max, increment, cache, whether\n" +
+			"it cycles, and its last value. Accepts a bare name or schema.name; a bare name that\n" +
+			"exists in multiple schemas must be qualified. Read-only.\n\n" +
+			"-o ddl emits a CREATE SEQUENCE reference (omits OWNED BY, ownership, grants).",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			format, err := parseFormatAllowingDDL(flagOutput)
+			if err != nil {
+				return usageError{err.Error()}
+			}
+			noteContext(cmd)
+			ctx := context.Background()
+			conn, release, err := dial(ctx, cmd, flagDatabase)
+			if err != nil {
+				return err
+			}
+			defer release()
+
+			d, err := catalog.DescribeSequence(ctx, conn, args[0])
+			if err != nil {
+				return err
+			}
+			switch format {
+			case render.FormatJSON:
+				return render.Render(cmd.OutOrStdout(), format, d)
+			case render.FormatDDL:
+				return renderSequenceDDL(cmd.OutOrStdout(), d)
+			}
+			return renderSequenceDetail(cmd, d)
+		},
+	}
+	return c
+}
+
+func renderSequenceDetail(cmd *cobra.Command, d *catalog.SequenceDetail) error {
+	out := cmd.OutOrStdout()
+	last := "—  (never used)"
+	if d.LastValue != nil {
+		last = withThousands(*d.LastValue)
+	}
+	cycle := "no"
+	if d.Cycle {
+		cycle = "yes"
+	}
+	fmt.Fprintf(out, "Sequence \"%s.%s\"\n", d.Schema, d.Name)
+	fmt.Fprintf(out, "Type:       %s\n", d.DataType)
+	fmt.Fprintf(out, "Increment:  %s\n", withThousands(d.Increment))
+	fmt.Fprintf(out, "Min / Max:  %s / %s\n", withThousands(d.Min), withThousands(d.Max))
+	fmt.Fprintf(out, "Start:      %s\n", withThousands(d.Start))
+	fmt.Fprintf(out, "Cache:      %s   Cycle: %s\n", withThousands(d.Cache), cycle)
+	fmt.Fprintf(out, "Last value: %s\n", last)
+	return nil
+}
+
+// functionOverloadsView lists the overloads a function name resolves to.
+type functionOverloadsView []catalog.FunctionOverload
+
+func (v functionOverloadsView) Headers() []string {
+	return []string{"SCHEMA", "KIND", "ARGUMENTS", "RETURNS", "LANGUAGE", "OWNER"}
+}
+func (v functionOverloadsView) Rows() [][]string {
+	out := make([][]string, 0, len(v))
+	for _, f := range v {
+		out = append(out, []string{f.Schema, f.Kind, dashIfEmpty(f.Args), f.Result, f.Language, f.Owner})
+	}
+	return out
 }
 
 type columnsView []catalog.Column

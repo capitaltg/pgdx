@@ -1595,13 +1595,18 @@ func newGetTablesCmd() *cobra.Command {
 			"-o mermaid emits an entity-relationship diagram of the schema: every table and the\n" +
 			"foreign keys between them. By default each table shows only its key columns (PK/FK/\n" +
 			"unique); add --all-columns for every column. Pair with --schema on a large database\n" +
-			"to keep the diagram readable.",
+			"to keep the diagram readable.\n\n" +
+			"-o ddl emits CREATE TABLE for every table (foreign keys deferred to trailing ALTER\n" +
+			"TABLE statements so the script replays in any order). It's a readable reference, not\n" +
+			"a pg_dump replacement — it omits identity/generated syntax, storage params, comments,\n" +
+			"ownership, and grants. Pair with --schema to scope a large database.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			// get tables additionally supports -o mermaid (a schema ER diagram); accept it
-			// here rather than widening render.ParseFormat, which all commands share.
+			// get tables additionally supports -o mermaid (a schema ER diagram) and -o ddl
+			// (CREATE TABLE for every table); accept them here rather than widening
+			// render.ParseFormat, which all commands share.
 			format := render.Format(flagOutput)
-			if format != render.FormatMermaid {
+			if format != render.FormatMermaid && format != render.FormatDDL {
 				var err error
 				format, err = render.ParseFormat(flagOutput)
 				if err != nil {
@@ -1626,6 +1631,33 @@ func newGetTablesCmd() *cobra.Command {
 					return err
 				}
 				return renderSchemaMermaid(cmd.OutOrStdout(), graph, allColumns)
+			}
+
+			if format == render.FormatDDL {
+				if usage || maintenance {
+					return usageError{"--usage/--maintenance can't be combined with -o ddl"}
+				}
+				tables, err := catalog.ListTables(ctx, conn, schema)
+				if err != nil {
+					return err
+				}
+				if len(tables) == 0 {
+					msg := "no tables found"
+					if schema != "" {
+						msg += fmt.Sprintf(" in schema %q", schema)
+					}
+					fmt.Fprintln(cmd.ErrOrStderr(), msg)
+					return nil
+				}
+				details := make([]*catalog.TableDetail, 0, len(tables))
+				for _, t := range tables {
+					d, err := catalog.DescribeTable(ctx, conn, t.Schema+"."+t.Name)
+					if err != nil {
+						return err
+					}
+					details = append(details, d)
+				}
+				return renderSchemaDDL(cmd.OutOrStdout(), details)
 			}
 
 			if usage {
