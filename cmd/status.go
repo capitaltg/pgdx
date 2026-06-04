@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,6 +42,8 @@ const (
 	slotRetainCritBytes = 1 << 30 // an inactive slot retaining >1 GB of WAL is flagged
 	checkpointForcedPct = 50.0    // forced/total checkpoints above this suggests small max_wal_size
 	checkpointMinSample = 10      // need at least this many checkpoints before judging the ratio
+	cacheHitWarnPct     = 90.0    // buffer cache hit ratio below this is worth a tuning note
+	cacheMinSample      = 10000   // need at least this many block accesses before judging the ratio
 )
 
 func symbol(sev string) string {
@@ -53,16 +57,49 @@ func symbol(sev string) string {
 	}
 }
 
+// A check's scope: whether its numbers describe the whole server or just the connected
+// database. Surfacing it stops the reader from having to know which catalogs are global
+// (pg_stat_activity, WAL, replication) and which are per-database (pg_stat_database,
+// pg_class).
+const (
+	scopeCluster  = "cluster"  // spans/affects the whole server (all databases)
+	scopeDatabase = "database" // describes only the connected database
+)
+
 // statusCheck is one line of the rollup. Detail holds the offending rows shown under
 // the line in --verbose mode (the PIDs, tables, standbys behind the count); it stays
 // empty otherwise, so the default screen and its JSON shape are unchanged.
 type statusCheck struct {
 	Name     string   `json:"name"`
+	Scope    string   `json:"scope,omitempty"` // cluster | database
 	Severity string   `json:"severity"`
 	Message  string   `json:"message"`
 	Hint     string   `json:"hint,omitempty"`   // the command to drill into
 	Detail   []string `json:"detail,omitempty"` // verbose-only: the rows behind the count
 }
+
+// checkScope maps each check (by Name) to whether it reports on the whole cluster or only
+// the connected database. Keyed by Name so it also covers checks that degraded to a
+// failCheck line. Wraparound is database-scoped here because the XID age it shows is read
+// from this database's pg_class — though the wraparound hazard itself shuts down the whole
+// cluster, so other databases warrant the same check.
+var checkScope = map[string]string{
+	"Connections":  scopeCluster,
+	"Locks":        scopeCluster,
+	"Transactions": scopeCluster,
+	"Replication":  scopeCluster,
+	"Slots":        scopeCluster,
+	"WAL":          scopeCluster,
+	"Checkpoints":  scopeCluster,
+	"Cache":        scopeDatabase,
+	"Temp files":   scopeDatabase,
+	"Bloat":        scopeDatabase,
+	"Wraparound":   scopeDatabase,
+}
+
+// errStatUnavailable degrades the cache/temp checks to an informational line when the
+// single pg_stat_database round trip failed, rather than aborting the whole rollup.
+var errStatUnavailable = errors.New("database statistics unavailable")
 
 // detailRows caps how many offending rows --verbose prints per check — enough to act on,
 // not so many that status stops being one screen. Drill into the Hint command for the rest.
@@ -86,6 +123,8 @@ type statusReport struct {
 	Database   string         `json:"database"`
 	Host       string         `json:"host"`
 	Port       uint16         `json:"port"`
+	Version    string         `json:"server_version,omitempty"`
+	SizeBytes  int64          `json:"size_bytes,omitempty"`
 	ServerTime string         `json:"server_time,omitempty"`
 	Summary    map[string]int `json:"summary"`
 	Checks     []statusCheck  `json:"checks"`
@@ -100,10 +139,14 @@ func newStatusCmd() *cobra.Command {
 		Short: "One-screen triage: is anything wrong right now?",
 		Long: "status answers the first question in an incident — 'where do I even look?' — with a\n" +
 			"single read-only snapshot. It checks connection saturation, blocked locks, the oldest\n" +
-			"open transaction, replication lag, XID-wraparound risk, and top bloat, marks each as\n" +
+			"open transaction, replication lag, pg_wal volume, XID-wraparound risk, buffer cache\n" +
+			"hit ratio, temp-file spill, and top bloat, marks each as\n" +
 			"⚠ (attention) / ✓ (healthy) / ○ (informational), and points at the command to drill\n" +
 			"into. A calm, mostly-✓ screen is itself the answer. Composes existing checks; adds no\n" +
 			"new load beyond a few quick catalog queries.\n\n" +
+			"Checks are split into two sections — cluster-wide (connections, locks, WAL, replication,\n" +
+			"checkpoints: the whole server) and the connected database (cache, temp files, bloat,\n" +
+			"wraparound) — so it's clear which scope each number describes.\n\n" +
 			"-v/--verbose expands each line into the rows behind it (the blocked PIDs, the lagging\n" +
 			"standbys, the top bloated tables) so you can act without a second command.\n" +
 			"--watch re-renders the snapshot on an interval (default 2s; --watch=5s to change it),\n" +
@@ -148,6 +191,9 @@ func runStatus(cmd *cobra.Command, verbose bool, watch time.Duration) error {
 // the single-shot path and each --watch tick.
 func buildReport(ctx context.Context, conn *db.Conn, verbose bool) statusReport {
 	now, _ := catalog.ServerTime(ctx, conn) // best-effort header stamp
+	// One round trip for the header (size, version) and the cache/temp checks below; a
+	// failure here just leaves those fields empty rather than aborting the rollup.
+	cdb, _ := catalog.GatherCurrentDB(ctx, conn)
 
 	var sig statusSignals
 	checks := []statusCheck{
@@ -156,9 +202,16 @@ func buildReport(ctx context.Context, conn *db.Conn, verbose bool) statusReport 
 		checkTransactions(ctx, conn, &sig, verbose),
 		checkReplication(ctx, conn, verbose),
 		checkReplicationSlots(ctx, conn, verbose),
+		checkWAL(ctx, conn),
 		checkWraparound(ctx, conn, &sig, verbose),
 		checkCheckpoints(ctx, conn),
+		checkCache(cdb),
+		checkTempFiles(cdb),
 		checkBloat(ctx, conn, verbose),
+	}
+
+	for i := range checks {
+		checks[i].Scope = checkScope[checks[i].Name]
 	}
 
 	report := statusReport{
@@ -169,6 +222,10 @@ func buildReport(ctx context.Context, conn *db.Conn, verbose bool) statusReport 
 		Summary:    map[string]int{sevCrit: 0, sevOK: 0, sevInfo: 0},
 		Checks:     checks,
 		StartHere:  synthesizeStartHere(sig),
+	}
+	if cdb != nil {
+		report.Version = shortVersion(cdb.Version)
+		report.SizeBytes = cdb.SizeBytes
 	}
 	for _, c := range checks {
 		report.Summary[c.Severity]++
@@ -381,6 +438,39 @@ func checkReplicationSlots(ctx context.Context, conn *db.Conn, verbose bool) sta
 	return c
 }
 
+// checkWAL reports the size of the pg_wal directory and its segment count — the disk the
+// write-ahead log occupies. It's a neutral readout (○): pg_wal legitimately holds up to
+// roughly max_wal_size plus whatever archiving or a replication slot is retaining (the
+// Slots check flags the latter). Reading pg_ls_waldir() needs pg_monitor or superuser, so
+// it degrades to an informational note rather than failing when the role can't.
+func checkWAL(ctx context.Context, conn *db.Conn) statusCheck {
+	info, err := catalog.WALUsage(ctx, conn)
+	if err != nil {
+		return statusCheck{Name: "WAL", Severity: sevInfo, Hint: "pgdx get settings max_wal_size",
+			Message: "size unavailable — reading pg_wal needs pg_monitor or superuser"}
+	}
+	return statusCheck{Name: "WAL", Severity: sevInfo, Hint: "pgdx get settings max_wal_size",
+		Message: formatWAL(info)}
+}
+
+// formatWAL renders the WAL line: the footprint, then its governors in parentheses so the
+// number reads against the limits that set it (e.g. "2.2 GB ... (max_wal_size 6.0 GB,
+// wal_keep_size 2.0 GB)"). wal_keep_size is shown only when set.
+func formatWAL(info *catalog.WALInfo) string {
+	msg := fmt.Sprintf("%s across %s segment(s) in pg_wal", humanBytes(info.Bytes), withThousands(info.Segments))
+	var refs []string
+	if info.MaxWALBytes > 0 {
+		refs = append(refs, "max_wal_size "+humanBytes(info.MaxWALBytes))
+	}
+	if info.WALKeepBytes > 0 {
+		refs = append(refs, "wal_keep_size "+humanBytes(info.WALKeepBytes))
+	}
+	if len(refs) > 0 {
+		msg += " (" + strings.Join(refs, ", ") + ")"
+	}
+	return msg
+}
+
 func slotStatusSuffix(walStatus string) string {
 	if walStatus == "" || walStatus == "reserved" {
 		return ""
@@ -408,6 +498,54 @@ func checkCheckpoints(ctx context.Context, conn *db.Conn) statusCheck {
 		c.Message += fmt.Sprintf(" — %.0f%% forced; consider raising max_wal_size", forcedPct)
 	}
 	return c
+}
+
+// checkCache reports the database's shared-buffer cache hit ratio. Like checkpoints it's
+// a cumulative-since-reset tuning signal, not a same-minute incident, so a low ratio is
+// informational (○), never critical. Quiet until enough I/O has happened to be meaningful.
+func checkCache(cdb *catalog.CurrentDB) statusCheck {
+	if cdb == nil {
+		return failCheck("Cache", errStatUnavailable)
+	}
+	c := statusCheck{Name: "Cache", Severity: sevOK, Hint: "pgdx get settings shared_buffers"}
+	total := cdb.BlksHit + cdb.BlksRead
+	if total < cacheMinSample {
+		c.Severity = sevInfo
+		c.Message = "too little I/O recorded to judge the buffer cache hit ratio"
+		return c
+	}
+	pct := 100 * float64(cdb.BlksHit) / float64(total)
+	c.Message = fmt.Sprintf("%.1f%% buffer cache hit ratio since stats reset", pct)
+	if pct < cacheHitWarnPct {
+		c.Severity = sevInfo
+		c.Message += " — low; the working set may not fit in shared_buffers"
+	}
+	return c
+}
+
+// checkTempFiles flags queries spilling to temp files — sorts or hashes that exceeded
+// work_mem. Cumulative since stats reset, so it's a tuning signal (○), never critical.
+func checkTempFiles(cdb *catalog.CurrentDB) statusCheck {
+	if cdb == nil {
+		return failCheck("Temp files", errStatUnavailable)
+	}
+	c := statusCheck{Name: "Temp files", Severity: sevOK, Hint: "pgdx get settings work_mem",
+		Message: "no queries have spilled to temp files since stats reset"}
+	if cdb.TempBytes > 0 {
+		c.Severity = sevInfo
+		c.Message = fmt.Sprintf("%s spilled to temp files since stats reset — sorts/hashes exceeding work_mem",
+			humanBytes(cdb.TempBytes))
+	}
+	return c
+}
+
+// shortVersion trims the server_version GUC ("16.2 (Ubuntu 16.2-1.pgdg…)") to its leading
+// version token for the header.
+func shortVersion(v string) string {
+	if i := strings.IndexByte(v, ' '); i > 0 {
+		return v[:i]
+	}
+	return v
 }
 
 func checkWraparound(ctx context.Context, conn *db.Conn, sig *statusSignals, verbose bool) statusCheck {
@@ -582,29 +720,74 @@ func printStatus(cmd *cobra.Command, r statusReport) {
 		host = "local"
 	}
 	fmt.Fprintf(out, "Database %q @ %s:%d", r.Database, host, r.Port)
+	if r.Version != "" {
+		fmt.Fprintf(out, " — PostgreSQL %s", r.Version)
+	}
+	if r.SizeBytes > 0 {
+		fmt.Fprintf(out, ", %s", humanBytes(r.SizeBytes))
+	}
 	if r.ServerTime != "" {
 		fmt.Fprintf(out, " — %s", r.ServerTime)
 	}
 	fmt.Fprintln(out)
 	fmt.Fprintln(out)
 
-	// Align the labels by their widest rune-count.
+	// Align the labels by their widest rune-count, across all checks so both sections line up.
 	width := 0
 	for _, c := range r.Checks {
 		if n := utf8.RuneCountInString(c.Name); n > width {
 			width = n
 		}
 	}
-	// Detail rows (verbose) hang under their check, indented to line up with the message.
-	indent := strings.Repeat(" ", width+6) // "X  " (3) + name+pad (width) + "   " (3)
-	for _, c := range r.Checks {
-		pad := strings.Repeat(" ", width-utf8.RuneCountInString(c.Name))
-		fmt.Fprintf(out, "%s  %s%s   %s\n", symbol(c.Severity), c.Name, pad, c.Message)
-		for _, d := range c.Detail {
-			fmt.Fprintf(out, "%s%s\n", indent, d)
+
+	// Render in two scoped sections so the reader can see at a glance which numbers describe
+	// the whole server and which describe only the connected database. A check whose scope
+	// is unset falls through to a final unsectioned pass (keeps older/synthetic reports
+	// rendering sensibly).
+	sections := []struct{ scope, heading string }{
+		{scopeCluster, "Cluster-wide (the whole server)"},
+		{scopeDatabase, fmt.Sprintf("This database (%q)", r.Database)},
+	}
+	printed := make([]bool, len(r.Checks))
+	wrote := false
+	for _, s := range sections {
+		var idxs []int
+		for i, c := range r.Checks {
+			if c.Scope == s.scope {
+				idxs = append(idxs, i)
+			}
+		}
+		if len(idxs) == 0 {
+			continue
+		}
+		if wrote {
+			fmt.Fprintln(out)
+		}
+		fmt.Fprintf(out, "%s\n", s.heading)
+		for _, i := range idxs {
+			printCheckLine(out, r.Checks[i], width, "  ")
+			printed[i] = true
+		}
+		wrote = true
+	}
+	for i, c := range r.Checks {
+		if !printed[i] {
+			printCheckLine(out, c, width, "")
 		}
 	}
+
 	if r.StartHere != "" {
 		fmt.Fprintf(out, "\n→ %s\n", r.StartHere)
+	}
+}
+
+// printCheckLine renders one check (and its verbose detail rows) with the given left
+// indent, aligning the message column at width and hanging detail rows beneath it.
+func printCheckLine(out io.Writer, c statusCheck, width int, gutter string) {
+	pad := strings.Repeat(" ", width-utf8.RuneCountInString(c.Name))
+	fmt.Fprintf(out, "%s%s  %s%s   %s\n", gutter, symbol(c.Severity), c.Name, pad, c.Message)
+	detailIndent := gutter + strings.Repeat(" ", width+6) // "X  " (3) + name+pad (width) + "   " (3)
+	for _, d := range c.Detail {
+		fmt.Fprintf(out, "%s%s\n", detailIndent, d)
 	}
 }

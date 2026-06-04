@@ -81,6 +81,80 @@ func TestSynthesizeStartHere(t *testing.T) {
 	})
 }
 
+func TestCheckCache(t *testing.T) {
+	t.Run("healthy ratio is OK", func(t *testing.T) {
+		c := checkCache(&catalog.CurrentDB{BlksHit: 999000, BlksRead: 1000})
+		if c.Severity != sevOK || !strings.Contains(c.Message, "99.9%") {
+			t.Fatalf("got severity=%q msg=%q", c.Severity, c.Message)
+		}
+	})
+	t.Run("low ratio is informational, not critical", func(t *testing.T) {
+		c := checkCache(&catalog.CurrentDB{BlksHit: 50000, BlksRead: 50000})
+		if c.Severity != sevInfo || !strings.Contains(c.Message, "shared_buffers") {
+			t.Fatalf("got severity=%q msg=%q", c.Severity, c.Message)
+		}
+	})
+	t.Run("too little I/O to judge", func(t *testing.T) {
+		c := checkCache(&catalog.CurrentDB{BlksHit: 5, BlksRead: 1})
+		if c.Severity != sevInfo || !strings.Contains(c.Message, "too little I/O") {
+			t.Fatalf("got severity=%q msg=%q", c.Severity, c.Message)
+		}
+	})
+	t.Run("nil stats degrade to unavailable", func(t *testing.T) {
+		if c := checkCache(nil); c.Severity != sevInfo || !strings.Contains(c.Message, "unavailable") {
+			t.Fatalf("got severity=%q msg=%q", c.Severity, c.Message)
+		}
+	})
+}
+
+func TestCheckTempFiles(t *testing.T) {
+	t.Run("no spill is OK", func(t *testing.T) {
+		if c := checkTempFiles(&catalog.CurrentDB{}); c.Severity != sevOK {
+			t.Fatalf("got severity=%q msg=%q", c.Severity, c.Message)
+		}
+	})
+	t.Run("spill is informational with the byte figure", func(t *testing.T) {
+		c := checkTempFiles(&catalog.CurrentDB{TempBytes: 5 << 20})
+		if c.Severity != sevInfo || !strings.Contains(c.Message, "work_mem") {
+			t.Fatalf("got severity=%q msg=%q", c.Severity, c.Message)
+		}
+	})
+}
+
+func TestShortVersion(t *testing.T) {
+	cases := map[string]string{
+		"16.2":                           "16.2",
+		"16.2 (Ubuntu 16.2-1.pgdg22.04)": "16.2",
+		"":                               "",
+	}
+	for in, want := range cases {
+		if got := shortVersion(in); got != want {
+			t.Fatalf("shortVersion(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestFormatWAL(t *testing.T) {
+	gb := int64(1) << 30
+	t.Run("annotates with both governors when set", func(t *testing.T) {
+		got := formatWAL(&catalog.WALInfo{Bytes: 2 * gb, Segments: 35, MaxWALBytes: 6 * gb, WALKeepBytes: 2 * gb})
+		for _, want := range []string{"35 segment(s)", "max_wal_size", "wal_keep_size"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("formatWAL missing %q: %q", want, got)
+			}
+		}
+	})
+	t.Run("omits wal_keep_size when unset", func(t *testing.T) {
+		got := formatWAL(&catalog.WALInfo{Bytes: gb, Segments: 16, MaxWALBytes: gb, WALKeepBytes: 0})
+		if strings.Contains(got, "wal_keep_size") {
+			t.Fatalf("formatWAL should omit unset wal_keep_size: %q", got)
+		}
+		if !strings.Contains(got, "max_wal_size") {
+			t.Fatalf("formatWAL should still show max_wal_size: %q", got)
+		}
+	})
+}
+
 func TestCapRows(t *testing.T) {
 	t.Run("under the cap passes through unchanged", func(t *testing.T) {
 		in := []string{"a", "b", "c"}
@@ -109,6 +183,33 @@ func TestTopCounts(t *testing.T) {
 	// Highest count first.
 	if len(got) != 3 || !strings.HasPrefix(got[0], "idle:") || !strings.HasPrefix(got[2], "active:") {
 		t.Fatalf("expected count-desc order, got %v", got)
+	}
+}
+
+func TestPrintStatusScopedSections(t *testing.T) {
+	var buf bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&buf)
+	printStatus(cmd, statusReport{
+		Database: "shop", Host: "db", Port: 5432,
+		Checks: []statusCheck{
+			{Name: "Connections", Scope: scopeCluster, Severity: sevOK, Message: "ok"},
+			{Name: "Cache", Scope: scopeDatabase, Severity: sevOK, Message: "100%"},
+		},
+	})
+	o := buf.String()
+	for _, want := range []string{"Cluster-wide (the whole server)", `This database ("shop")`} {
+		if !strings.Contains(o, want) {
+			t.Fatalf("missing section heading %q:\n%s", want, o)
+		}
+	}
+	// Cluster section precedes the database section.
+	if strings.Index(o, "Cluster-wide") > strings.Index(o, "This database") {
+		t.Fatalf("cluster section must come first:\n%s", o)
+	}
+	// A cluster check renders under the cluster heading, before the database heading.
+	if !(strings.Index(o, "Connections") < strings.Index(o, "This database")) {
+		t.Fatalf("Connections should be in the cluster section:\n%s", o)
 	}
 }
 

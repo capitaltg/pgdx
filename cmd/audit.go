@@ -13,10 +13,12 @@ import (
 	"github.com/capitaltg/pgdx/internal/render"
 )
 
-// audit runs pgdx's security hardening checks against the connected database:
-// superuser/BYPASSRLS login roles, a world-writable public schema, RLS policies
-// that are defined but not enforced, md5 password storage, server SSL being off,
-// trust/cleartext pg_hba rules, and installed untrusted procedural languages.
+// audit runs pgdx's hygiene checks against the connected database in two sections.
+// Security: superuser/BYPASSRLS login roles, a world-writable public schema, RLS
+// policies defined but not enforced, md5 password storage, server SSL off,
+// trust/cleartext pg_hba rules, and untrusted procedural languages. Reliability:
+// crash-safety GUCs turned off (fsync, full_page_writes, …), autovacuum disabled,
+// and checkpoints being forced by WAL volume.
 //
 // These are hygiene checks, not a compliance certification — pgdx is a client, so
 // it audits what the catalogs expose and skips (loudly) what its privileges can't
@@ -25,10 +27,11 @@ func newAuditCmd() *cobra.Command {
 	var exitCode bool
 	c := &cobra.Command{
 		Use:   "audit",
-		Short: "Security hardening checks: roles, schema exposure, RLS, SSL, auth, languages",
-		Long: "audit runs a set of read-only security hygiene checks against the connected\n" +
-			"database and reports findings grouped by severity (critical / warning / info),\n" +
-			"each with a one-line remediation:\n\n" +
+		Short: "Hygiene checks — security (roles, RLS, SSL, auth) and reliability (durability, autovacuum)",
+		Long: "audit runs a set of read-only hygiene checks against the connected database and\n" +
+			"reports findings grouped into SECURITY and RELIABILITY sections, each ordered by\n" +
+			"severity (critical / warning / info) with a one-line remediation.\n\n" +
+			"Security:\n" +
 			"  • login roles with SUPERUSER or BYPASSRLS\n" +
 			"  • a public schema that any role can create objects in\n" +
 			"  • tables with row-level security POLICIES defined but RLS not enabled\n" +
@@ -37,6 +40,11 @@ func newAuditCmd() *cobra.Command {
 			"  • server SSL/TLS disabled\n" +
 			"  • pg_hba.conf rules using trust (no password) or cleartext password auth\n" +
 			"  • installed untrusted procedural languages (plpython3u, plperlu, …)\n\n" +
+			"Reliability:\n" +
+			"  • crash-safety GUCs turned off (fsync, full_page_writes, zero_damaged_pages,\n" +
+			"    synchronous_commit)\n" +
+			"  • autovacuum disabled (or track_counts off, which starves it)\n" +
+			"  • checkpoints mostly forced by WAL volume — a sign max_wal_size is too small\n\n" +
 			"These are hygiene checks, not a compliance audit. pgdx connects as a client, so\n" +
 			"it cannot read postgresql.conf and needs superuser (or pg_read_all_settings) to\n" +
 			"read pg_hba.conf — a check it can't run is reported as SKIPPED rather than\n" +
@@ -90,7 +98,7 @@ func printSecurityAudit(cmd *cobra.Command, conn *db.Conn, a *catalog.SecurityAu
 	if host == "" {
 		host = "local"
 	}
-	fmt.Fprintf(e, "Security audit of %q @ %s:%d\n", a.Database, host, conn.Port())
+	fmt.Fprintf(e, "Audit of %q @ %s:%d\n", a.Database, host, conn.Port())
 
 	printAuditFindings(out, a)
 
@@ -106,20 +114,39 @@ func printSecurityAudit(cmd *cobra.Command, conn *db.Conn, a *catalog.SecurityAu
 	}
 }
 
-// printAuditFindings writes the severity-grouped findings to w. Split out from
-// printSecurityAudit (which adds the connection header and stderr summary) so it
-// is testable without a database connection.
+// categoryHeading is the section banner for a finding category.
+func categoryHeading(category string) string {
+	if category == catalog.CategoryReliability {
+		return "RELIABILITY"
+	}
+	return "SECURITY"
+}
+
+// printAuditFindings writes the findings to w, grouped by category (SECURITY, then
+// RELIABILITY) and, within each, by severity. Split out from printSecurityAudit (which
+// adds the connection header and stderr summary) so it is testable without a database
+// connection.
 func printAuditFindings(w io.Writer, a *catalog.SecurityAudit) {
 	if len(a.Findings) == 0 {
 		return
 	}
-	// Findings arrive sorted by severity; emit each group under its heading.
+	// Findings arrive sorted by (category, severity); emit a banner when the category
+	// changes and a sub-heading when the severity changes within it.
+	lastCat := ""
 	var lastSev catalog.Severity = ""
+	first := true
 	for _, f := range a.Findings {
-		if f.Severity != lastSev {
-			if lastSev != "" {
+		// Normalize so a finding with no explicit category groups under SECURITY.
+		cat := categoryHeading(f.Category)
+		if cat != lastCat {
+			if !first {
 				fmt.Fprintln(w)
 			}
+			fmt.Fprintf(w, "── %s ──\n", cat)
+			lastCat = cat
+			lastSev = ""
+		}
+		if f.Severity != lastSev {
 			fmt.Fprintln(w, strings.ToUpper(string(f.Severity)))
 			lastSev = f.Severity
 		}
@@ -128,6 +155,7 @@ func printAuditFindings(w io.Writer, a *catalog.SecurityAudit) {
 		if f.Remediation != "" {
 			fmt.Fprintf(w, "    → %s\n", f.Remediation)
 		}
+		first = false
 	}
 }
 

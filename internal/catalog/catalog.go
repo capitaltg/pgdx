@@ -1896,6 +1896,106 @@ func ListDatabases(ctx context.Context, q Querier, sort string) ([]Database, err
 	return out, rows.Err()
 }
 
+// CurrentDB bundles the connected database's identity, size, server version, and the
+// cumulative pg_stat_database counters that `status` needs for its header and its
+// cache/temp-file checks — fetched in one round trip. The counters are since the
+// database's stats_reset, so they're lifetime ratios, not a right-now sample.
+type CurrentDB struct {
+	Name       string `json:"name"`
+	Version    string `json:"server_version"` // server_version GUC, e.g. "16.2"
+	SizeBytes  int64  `json:"size_bytes"`
+	BlksHit    int64  `json:"blks_hit"`    // shared-buffer hits since stats_reset
+	BlksRead   int64  `json:"blks_read"`   // disk block reads since stats_reset
+	TempBytes  int64  `json:"temp_bytes"`  // bytes spilled to temp files (work_mem pressure)
+	Deadlocks  int64  `json:"deadlocks"`   // deadlocks detected since stats_reset
+	StatsReset string `json:"stats_reset"` // when the counters were last reset ("" if never)
+}
+
+// GatherCurrentDB returns the connected database's size, server version, and cumulative
+// pg_stat_database counters in a single read-only query. The counters come from a
+// subquery so the row is returned even when (rarely) the database has no stats row yet.
+func GatherCurrentDB(ctx context.Context, q Querier) (*CurrentDB, error) {
+	const sql = `SELECT current_database(),
+       current_setting('server_version'),
+       pg_catalog.pg_database_size(current_database())::bigint,
+       COALESCE((SELECT blks_hit   FROM pg_catalog.pg_stat_database WHERE datname = current_database()), 0),
+       COALESCE((SELECT blks_read  FROM pg_catalog.pg_stat_database WHERE datname = current_database()), 0),
+       COALESCE((SELECT temp_bytes FROM pg_catalog.pg_stat_database WHERE datname = current_database()), 0),
+       COALESCE((SELECT deadlocks  FROM pg_catalog.pg_stat_database WHERE datname = current_database()), 0),
+       COALESCE((SELECT stats_reset::text FROM pg_catalog.pg_stat_database WHERE datname = current_database()), '')`
+	c := &CurrentDB{}
+	if err := scanRow(ctx, q, sql,
+		&c.Name, &c.Version, &c.SizeBytes, &c.BlksHit, &c.BlksRead, &c.TempBytes, &c.Deadlocks, &c.StatsReset); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// WALInfo is the pg_wal footprint plus the two settings that govern its expected size:
+// max_wal_size (the checkpoint target) and wal_keep_size (WAL deliberately retained for
+// standbys). Surfacing the governors alongside the size makes a normal reading read as
+// normal — pg_wal is expected to hold roughly max_wal_size plus wal_keep_size.
+type WALInfo struct {
+	Bytes        int64 `json:"bytes"`
+	Segments     int64 `json:"segments"`
+	MaxWALBytes  int64 `json:"max_wal_size_bytes"`  // 0 if unparseable
+	WALKeepBytes int64 `json:"wal_keep_size_bytes"` // 0 when wal_keep_size is unset
+}
+
+// WALUsage returns the pg_wal footprint (from pg_ls_waldir()) and its governing settings.
+// Reading pg_ls_waldir() needs pg_monitor (or superuser); the caller turns a privilege
+// error into a graceful note rather than failing.
+func WALUsage(ctx context.Context, q Querier) (*WALInfo, error) {
+	const sql = `SELECT b.bytes, b.segs,
+       pg_catalog.pg_size_bytes(current_setting('max_wal_size')),
+       pg_catalog.pg_size_bytes(current_setting('wal_keep_size'))
+FROM (SELECT COALESCE(sum(size), 0)::bigint AS bytes, count(*)::bigint AS segs
+      FROM pg_catalog.pg_ls_waldir()) b`
+	w := &WALInfo{}
+	if err := scanRow(ctx, q, sql, &w.Bytes, &w.Segments, &w.MaxWALBytes, &w.WALKeepBytes); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+// ---- Tablespaces ----
+
+// Tablespace is one row of `pgdx get tablespaces`.
+type Tablespace struct {
+	Name      string `json:"name"`
+	Owner     string `json:"owner"`
+	SizeBytes int64  `json:"size_bytes"` // -1 when the role lacks privilege to size it
+	Location  string `json:"location"`   // on-disk path; "" for the built-in pg_default/pg_global
+}
+
+// ListTablespaces lists every tablespace with owner, size, and location. pg_tablespace_size
+// raises on insufficient privilege, so it's guarded per-row (CASE short-circuits) — a
+// tablespace the role can't measure shows -1 rather than failing the whole listing.
+func ListTablespaces(ctx context.Context, q Querier) ([]Tablespace, error) {
+	const sql = `SELECT t.spcname,
+       pg_catalog.pg_get_userbyid(t.spcowner),
+       (CASE WHEN pg_catalog.has_tablespace_privilege(current_user, t.oid, 'CREATE')
+                  OR pg_catalog.pg_has_role(current_user, 'pg_read_all_stats', 'USAGE')
+             THEN pg_catalog.pg_tablespace_size(t.oid) ELSE -1 END)::bigint,
+       COALESCE(pg_catalog.pg_tablespace_location(t.oid), '')
+FROM pg_catalog.pg_tablespace t
+ORDER BY t.spcname`
+	rows, err := q.Query(ctx, sql)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Tablespace
+	for rows.Next() {
+		var t Tablespace
+		if err := rows.Scan(&t.Name, &t.Owner, &t.SizeBytes, &t.Location); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // ---- Extensions ----
 
 type Extension struct {
@@ -2630,6 +2730,76 @@ func ListTableUsage(ctx context.Context, q Querier, schema string) ([]TableUsage
 			u.IdxPct = -1 // never scanned at all
 		}
 		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// TableMaintenance is one row of `pgdx get tables --maintenance`: how recently each table
+// was vacuumed/analyzed and how stale its planner statistics are. The age fields are
+// seconds since the most recent of the manual/auto event (-1 = it never happened); the
+// timestamps carry the same events as text for -o json. ModsSinceAnalyze (rows changed
+// since the last ANALYZE) is the stale-statistics signal that drives bad row estimates.
+type TableMaintenance struct {
+	Schema           string  `json:"schema"`
+	Name             string  `json:"name"`
+	LiveTup          int64   `json:"live_tuples"`
+	DeadTup          int64   `json:"dead_tuples"`
+	LastVacuum       string  `json:"last_vacuum"`        // most recent manual/auto vacuum (RFC3339); "" if never
+	LastAnalyze      string  `json:"last_analyze"`       // most recent manual/auto analyze (RFC3339); "" if never
+	VacuumAgeSec     float64 `json:"vacuum_age_sec"`     // seconds since LastVacuum; -1 if never
+	AnalyzeAgeSec    float64 `json:"analyze_age_sec"`    // seconds since LastAnalyze; -1 if never
+	ModsSinceAnalyze int64   `json:"mods_since_analyze"` // n_mod_since_analyze — rows changed since last ANALYZE
+	AutovacuumCount  int64   `json:"autovacuum_count"`   // times autovacuum has run on this table
+}
+
+// buildTableMaintenanceQuery lists tables with their vacuum/analyze recency and
+// stats-staleness counters. last_vacuum and last_autovacuum are folded with GREATEST into
+// "most recently vacuumed, by either path" (same for analyze). Most-stale first — the
+// highest n_mod_since_analyze, i.e. the tables autovacuum is most behind on — so the
+// neglected ones rise to the top. Filters mirror buildTablesQuery.
+func buildTableMaintenanceQuery(schema string) (string, []any) {
+	q := `SELECT n.nspname, c.relname,
+       COALESCE(s.n_live_tup, 0),
+       COALESCE(s.n_dead_tup, 0),
+       COALESCE(GREATEST(s.last_vacuum, s.last_autovacuum)::text, ''),
+       COALESCE(GREATEST(s.last_analyze, s.last_autoanalyze)::text, ''),
+       COALESCE(EXTRACT(epoch FROM (now() - GREATEST(s.last_vacuum, s.last_autovacuum))), -1)::float8,
+       COALESCE(EXTRACT(epoch FROM (now() - GREATEST(s.last_analyze, s.last_autoanalyze))), -1)::float8,
+       COALESCE(s.n_mod_since_analyze, 0),
+       COALESCE(s.autovacuum_count, 0)
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_catalog.pg_stat_all_tables s ON s.relid = c.oid
+WHERE c.relkind IN ('r', 'p')
+  AND n.nspname !~ '^pg_'
+  AND n.nspname <> 'information_schema'`
+	var args []any
+	if schema != "" {
+		q += "\n  AND n.nspname = $1"
+		args = append(args, schema)
+	}
+	q += "\nORDER BY COALESCE(s.n_mod_since_analyze, 0) DESC, COALESCE(s.n_dead_tup, 0) DESC, n.nspname, c.relname"
+	return q, args
+}
+
+// ListTableMaintenance returns per-table vacuum/analyze recency and stats staleness,
+// most-stale first.
+func ListTableMaintenance(ctx context.Context, q Querier, schema string) ([]TableMaintenance, error) {
+	sql, args := buildTableMaintenanceQuery(schema)
+	rows, err := q.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TableMaintenance
+	for rows.Next() {
+		var m TableMaintenance
+		if err := rows.Scan(&m.Schema, &m.Name, &m.LiveTup, &m.DeadTup,
+			&m.LastVacuum, &m.LastAnalyze, &m.VacuumAgeSec, &m.AnalyzeAgeSec,
+			&m.ModsSinceAnalyze, &m.AutovacuumCount); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
 	}
 	return out, rows.Err()
 }

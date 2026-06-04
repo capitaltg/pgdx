@@ -32,10 +32,19 @@ func (s Severity) rank() int {
 	}
 }
 
+// Finding categories. Security findings weaken the security posture; reliability
+// findings risk data durability, bloat, or wraparound — the operational counterpart.
+const (
+	CategorySecurity    = "security"
+	CategoryReliability = "reliability"
+)
+
 // SecurityFinding is one issue surfaced by `pgdx audit`. Check is a stable id
 // (e.g. "superuser-roles") so JSON consumers can match on it without parsing prose.
+// Category splits security from reliability findings in the output.
 type SecurityFinding struct {
 	Check       string   `json:"check"`
+	Category    string   `json:"category"`
 	Severity    Severity `json:"severity"`
 	Title       string   `json:"title"`
 	Detail      string   `json:"detail"`
@@ -89,10 +98,12 @@ func (a *SecurityAudit) HasAtLeast(min Severity) bool {
 
 // securityCheck is one audit probe. It returns findings (possibly none), or a
 // non-nil *SkippedCheck when it lacked the privilege to run. A returned error is
-// a genuine failure and aborts the audit.
+// a genuine failure and aborts the audit. category tags every finding the probe
+// produces, so the output can group security and reliability separately.
 type securityCheck struct {
-	id  string
-	run func(ctx context.Context, q Querier) ([]SecurityFinding, *SkippedCheck, error)
+	id       string
+	category string
+	run      func(ctx context.Context, q Querier) ([]SecurityFinding, *SkippedCheck, error)
 }
 
 // AuditSecurity runs pgdx's hardening checks against the connected database and
@@ -105,17 +116,20 @@ type securityCheck struct {
 // best-effort and skips cleanly when the role can't see pg_hba_file_rules.
 func AuditSecurity(ctx context.Context, q Querier) (*SecurityAudit, error) {
 	checks := []securityCheck{
-		{"superuser-roles", checkSuperuserRoles},
-		{"privileged-roles", checkPrivilegedRoles},
-		{"public-schema", checkPublicSchema},
-		{"schema-public-create", checkSchemaPublicCreate},
-		{"rls-disabled", checkRLSDisabled},
-		{"password-encryption", checkPasswordEncryption},
-		{"ssl", checkSSL},
-		{"session-ssl", checkSessionSSL},
-		{"hba-auth", checkHBAAuth},
-		{"logging", checkLogging},
-		{"untrusted-languages", checkUntrustedLanguages},
+		{"superuser-roles", CategorySecurity, checkSuperuserRoles},
+		{"privileged-roles", CategorySecurity, checkPrivilegedRoles},
+		{"public-schema", CategorySecurity, checkPublicSchema},
+		{"schema-public-create", CategorySecurity, checkSchemaPublicCreate},
+		{"rls-disabled", CategorySecurity, checkRLSDisabled},
+		{"password-encryption", CategorySecurity, checkPasswordEncryption},
+		{"ssl", CategorySecurity, checkSSL},
+		{"session-ssl", CategorySecurity, checkSessionSSL},
+		{"hba-auth", CategorySecurity, checkHBAAuth},
+		{"logging", CategorySecurity, checkLogging},
+		{"untrusted-languages", CategorySecurity, checkUntrustedLanguages},
+		{"durability-settings", CategoryReliability, checkDurabilitySettings},
+		{"autovacuum-config", CategoryReliability, checkAutovacuumConfig},
+		{"checkpoint-pressure", CategoryReliability, checkCheckpointPressure},
 	}
 
 	a := &SecurityAudit{}
@@ -129,13 +143,28 @@ func AuditSecurity(ctx context.Context, q Querier) (*SecurityAudit, error) {
 			continue
 		}
 		a.Checks++
+		for i := range findings {
+			findings[i].Category = c.category
+		}
 		a.Findings = append(a.Findings, findings...)
 	}
 
+	// Group security before reliability, and within each, most-severe first.
 	sort.SliceStable(a.Findings, func(i, j int) bool {
+		if ri, rj := categoryRank(a.Findings[i].Category), categoryRank(a.Findings[j].Category); ri != rj {
+			return ri < rj
+		}
 		return a.Findings[i].Severity.rank() < a.Findings[j].Severity.rank()
 	})
 	return a, nil
+}
+
+// categoryRank orders categories for display (security first, then reliability).
+func categoryRank(c string) int {
+	if c == CategoryReliability {
+		return 1
+	}
+	return 0
 }
 
 // isPermissionDenied reports whether err is a Postgres "insufficient_privilege"
@@ -697,6 +726,173 @@ func isLogOn(v string) bool {
 		return false
 	default:
 		return true
+	}
+}
+
+// ---- reliability: durability GUCs ----
+
+// reliabBoolOff reports whether a boolean GUC string reads as off/false.
+func reliabBoolOff(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "off", "false", "0", "no", "":
+		return true
+	default:
+		return false
+	}
+}
+
+// checkDurabilitySettings flags GUCs that trade away crash safety. fsync and
+// full_page_writes off can corrupt the cluster on an OS/hardware crash;
+// zero_damaged_pages on makes Postgres silently discard corrupt pages (data loss).
+// synchronous_commit off is a legitimate latency/durability trade-off (a crash can
+// lose the last few committed transactions), so it's INFO, not a warning. These read
+// from current_setting and need no special privilege.
+func checkDurabilitySettings(ctx context.Context, q Querier) ([]SecurityFinding, *SkippedCheck, error) {
+	rows, err := q.Query(ctx, `SELECT current_setting('fsync'),
+       current_setting('full_page_writes'),
+       current_setting('zero_damaged_pages'),
+       current_setting('synchronous_commit')`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	var fsync, fpw, zdp, syncCommit string
+	if rows.Next() {
+		if err := rows.Scan(&fsync, &fpw, &zdp, &syncCommit); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return durabilityFindings(fsync, fpw, zdp, syncCommit), nil, nil
+}
+
+// durabilityFindings is the pure decision logic for checkDurabilitySettings.
+func durabilityFindings(fsync, fpw, zdp, syncCommit string) []SecurityFinding {
+	var out []SecurityFinding
+	if reliabBoolOff(fsync) {
+		out = append(out, SecurityFinding{
+			Check: "durability-settings", Severity: SeverityCritical,
+			Title:       "fsync is off",
+			Detail:      "fsync = off means Postgres does not force writes to disk. An OS crash or power loss can leave the database irrecoverably corrupted.",
+			Remediation: "Set fsync = on. Leave it off only on a database whose data you can afford to lose entirely (e.g. a throwaway load-test instance).",
+		})
+	}
+	if reliabBoolOff(fpw) {
+		out = append(out, SecurityFinding{
+			Check: "durability-settings", Severity: SeverityCritical,
+			Title:       "full_page_writes is off",
+			Detail:      "full_page_writes = off risks torn pages: a crash during a page write can leave a half-written block that recovery cannot repair, corrupting data.",
+			Remediation: "Set full_page_writes = on unless your storage guarantees atomic page writes.",
+		})
+	}
+	if !reliabBoolOff(zdp) { // zero_damaged_pages ON is the dangerous state
+		out = append(out, SecurityFinding{
+			Check: "durability-settings", Severity: SeverityWarning,
+			Title:       "zero_damaged_pages is on",
+			Detail:      "zero_damaged_pages = on makes Postgres zero out (discard) pages it finds corrupt instead of erroring — silent data loss. It's a recovery-only escape hatch.",
+			Remediation: "Set zero_damaged_pages = off in normal operation; enable it only briefly while salvaging a damaged table.",
+		})
+	}
+	if strings.EqualFold(strings.TrimSpace(syncCommit), "off") {
+		out = append(out, SecurityFinding{
+			Check: "durability-settings", Severity: SeverityInfo,
+			Title:       "synchronous_commit is off",
+			Detail:      "synchronous_commit = off lets COMMIT return before the WAL is durably flushed, so a crash can lose the last fraction of a second of committed transactions. This is a deliberate throughput trade-off — fine if you accept it.",
+			Remediation: "Set synchronous_commit = on if every committed transaction must survive a crash.",
+		})
+	}
+	return out
+}
+
+// checkAutovacuumConfig flags autovacuum being disabled cluster-wide, and track_counts
+// being off (which starves autovacuum of the dead-tuple stats it triggers on). With
+// autovacuum off, dead tuples accumulate unchecked and XID wraparound creeps toward a
+// forced shutdown — so it's CRITICAL. Reads from current_setting; no special privilege.
+func checkAutovacuumConfig(ctx context.Context, q Querier) ([]SecurityFinding, *SkippedCheck, error) {
+	rows, err := q.Query(ctx, `SELECT current_setting('autovacuum'), current_setting('track_counts')`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	var autovac, trackCounts string
+	if rows.Next() {
+		if err := rows.Scan(&autovac, &trackCounts); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return autovacuumFindings(autovac, trackCounts), nil, nil
+}
+
+// autovacuumFindings is the pure decision logic for checkAutovacuumConfig.
+func autovacuumFindings(autovac, trackCounts string) []SecurityFinding {
+	var out []SecurityFinding
+	if reliabBoolOff(autovac) {
+		out = append(out, SecurityFinding{
+			Check: "autovacuum-config", Severity: SeverityCritical,
+			Title:       "autovacuum is disabled",
+			Detail:      "autovacuum = off means dead tuples are never reclaimed automatically and tables are never auto-analyzed — bloat grows unchecked and XID age climbs toward a forced anti-wraparound shutdown.",
+			Remediation: "Set autovacuum = on. If it was disabled for a one-off bulk load, re-enable it and VACUUM (ANALYZE) the affected tables.",
+		})
+	}
+	if reliabBoolOff(trackCounts) {
+		out = append(out, SecurityFinding{
+			Check: "autovacuum-config", Severity: SeverityWarning,
+			Title:       "track_counts is off",
+			Detail:      "track_counts = off stops Postgres from counting row changes, so autovacuum can't tell when a table needs vacuuming or analyzing — it effectively stops triggering.",
+			Remediation: "Set track_counts = on (the default) so autovacuum can see dead-tuple activity.",
+		})
+	}
+	return out
+}
+
+// reliabCheckpoint* mirror the status checkpoint thresholds: a high share of forced
+// checkpoints over a meaningful sample suggests max_wal_size is too small.
+const (
+	reliabCheckpointForcedPct = 50.0
+	reliabCheckpointMinSample = 10
+)
+
+// checkCheckpointPressure connects a runtime symptom to the knob: when most checkpoints
+// are being forced by WAL volume (rather than firing on checkpoint_timeout), max_wal_size
+// is usually too small, which hurts write throughput. Evidence-based — it only fires when
+// the counters show it — so it's a WARNING with the actual ratio in the detail.
+func checkCheckpointPressure(ctx context.Context, q Querier) ([]SecurityFinding, *SkippedCheck, error) {
+	cs, err := CheckpointActivity(ctx, q)
+	if err != nil {
+		if isPermissionDenied(err) {
+			return nil, &SkippedCheck{Check: "checkpoint-pressure", Reason: "reading checkpoint stats needs access to pg_stat_bgwriter/pg_stat_checkpointer"}, nil
+		}
+		return nil, nil, err
+	}
+	if f := checkpointPressureFinding(cs); f != nil {
+		return []SecurityFinding{*f}, nil, nil
+	}
+	return nil, nil, nil
+}
+
+// checkpointPressureFinding is the pure decision logic: a finding only when a meaningful
+// sample of checkpoints is mostly forced. Returns nil when there's too little data or the
+// forced ratio is healthy.
+func checkpointPressureFinding(cs CheckpointStats) *SecurityFinding {
+	total := cs.Timed + cs.Requested
+	if total < reliabCheckpointMinSample {
+		return nil // too few checkpoints to judge
+	}
+	forcedPct := 100 * float64(cs.Requested) / float64(total)
+	if forcedPct < reliabCheckpointForcedPct {
+		return nil
+	}
+	return &SecurityFinding{
+		Check: "checkpoint-pressure", Severity: SeverityWarning,
+		Title: "checkpoints are mostly forced by WAL volume",
+		Detail: fmt.Sprintf("%.0f%% of %d checkpoints since the last stats reset were forced (triggered by hitting max_wal_size) rather than firing on the timer. Frequent forced checkpoints increase write amplification and I/O.",
+			forcedPct, total),
+		Remediation: "Raise max_wal_size so checkpoints fire on checkpoint_timeout instead of WAL pressure (see `pgdx get settings max_wal_size`).",
 	}
 }
 

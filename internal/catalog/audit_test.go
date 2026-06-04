@@ -187,6 +187,85 @@ func TestSessionSSLFinding(t *testing.T) {
 	}
 }
 
+func severitiesByCheck(findings []SecurityFinding) map[string]Severity {
+	m := map[string]Severity{}
+	for _, f := range findings {
+		m[f.Title] = f.Severity
+	}
+	return m
+}
+
+func TestDurabilityFindings(t *testing.T) {
+	t.Run("all safe → no findings", func(t *testing.T) {
+		if f := durabilityFindings("on", "on", "off", "on"); len(f) != 0 {
+			t.Fatalf("want no findings for safe settings, got %v", f)
+		}
+	})
+	t.Run("fsync and full_page_writes off are critical", func(t *testing.T) {
+		got := severitiesByCheck(durabilityFindings("off", "off", "off", "on"))
+		if got["fsync is off"] != SeverityCritical || got["full_page_writes is off"] != SeverityCritical {
+			t.Fatalf("expected criticals, got %v", got)
+		}
+	})
+	t.Run("zero_damaged_pages on is a warning", func(t *testing.T) {
+		got := severitiesByCheck(durabilityFindings("on", "on", "on", "on"))
+		if got["zero_damaged_pages is on"] != SeverityWarning {
+			t.Fatalf("expected warning, got %v", got)
+		}
+	})
+	t.Run("synchronous_commit off is info, not a warning", func(t *testing.T) {
+		got := severitiesByCheck(durabilityFindings("on", "on", "off", "off"))
+		if got["synchronous_commit is off"] != SeverityInfo {
+			t.Fatalf("expected info, got %v", got)
+		}
+	})
+}
+
+func TestAutovacuumFindings(t *testing.T) {
+	if f := autovacuumFindings("on", "on"); len(f) != 0 {
+		t.Fatalf("want no findings when healthy, got %v", f)
+	}
+	got := severitiesByCheck(autovacuumFindings("off", "off"))
+	if got["autovacuum is disabled"] != SeverityCritical {
+		t.Fatalf("autovacuum off should be critical, got %v", got)
+	}
+	if got["track_counts is off"] != SeverityWarning {
+		t.Fatalf("track_counts off should be warning, got %v", got)
+	}
+}
+
+func TestCheckpointPressureFinding(t *testing.T) {
+	t.Run("too few checkpoints → nil", func(t *testing.T) {
+		if f := checkpointPressureFinding(CheckpointStats{Timed: 2, Requested: 3}); f != nil {
+			t.Fatalf("want nil for tiny sample, got %v", f)
+		}
+	})
+	t.Run("mostly timed → nil", func(t *testing.T) {
+		if f := checkpointPressureFinding(CheckpointStats{Timed: 100, Requested: 5}); f != nil {
+			t.Fatalf("want nil when healthy, got %v", f)
+		}
+	})
+	t.Run("mostly forced → warning", func(t *testing.T) {
+		f := checkpointPressureFinding(CheckpointStats{Timed: 10, Requested: 40})
+		if f == nil || f.Severity != SeverityWarning {
+			t.Fatalf("expected a warning finding, got %v", f)
+		}
+	})
+}
+
+func TestReliabBoolOff(t *testing.T) {
+	for _, off := range []string{"off", "false", "0", "no", "", " OFF "} {
+		if !reliabBoolOff(off) {
+			t.Errorf("reliabBoolOff(%q) = false, want true", off)
+		}
+	}
+	for _, on := range []string{"on", "true", "1", "local"} {
+		if reliabBoolOff(on) {
+			t.Errorf("reliabBoolOff(%q) = true, want false", on)
+		}
+	}
+}
+
 func TestIsLogOn(t *testing.T) {
 	for _, on := range []string{"on", "true", "1", "all", "ON"} {
 		if !isLogOn(on) {

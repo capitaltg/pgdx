@@ -154,11 +154,16 @@ It's the "what's in here and how big is it" companion to `status` ("is anything 
 and `get databases` (the cluster-wide list). Defaults to the connected database; `-d`
 points it at another. `-o json` emits every figure.
 
-`status` is the front door for an incident or a morning check. In one read-only snapshot
-it checks connection saturation, blocked locks, the oldest open transaction, replication
-lag, inactive replication slots (pinned WAL), XID-wraparound risk, forced-vs-scheduled
-checkpoints, and top bloat — marks each ⚠ / ✓ / ○ — and points at the command to drill
-into. It correlates signals where it can (a lock root blocker that's *also* the
+`status` is the front door for an incident or a morning check. Its header names the
+database, its size, and the server version at a glance. In one read-only snapshot it
+checks connection saturation, blocked locks, the oldest open transaction, replication
+lag, inactive replication slots (pinned WAL), total pg_wal volume, XID-wraparound risk,
+forced-vs-scheduled checkpoints, buffer cache hit ratio, temp-file spill (work_mem
+pressure), and top bloat — marks each ⚠ / ✓ / ○ — and points at the command to drill into.
+The checks are split into two sections — **cluster-wide** (connections, locks, WAL,
+replication, checkpoints: shared by the whole server) and **this database** (cache, temp
+files, bloat, wraparound: the connected database only) — so it's clear which scope each
+number describes. It correlates signals where it can (a lock root blocker that's *also* the
 oldest transaction is the textbook idle-in-transaction incident) and ends with a single
 "start here" pointer. A calm, mostly-✓ screen is itself the answer.
 
@@ -248,6 +253,7 @@ diagnosis. Handy for a plan pulled from a slow-query log, `auto_explain`, or a c
 ```bash
 pgdx get tables [--schema S]          # tables: size, est rows, DEAD% (bloat)
 pgdx get tables --usage               # read/write patterns: seq vs index scans (IDX%), ins/upd/del
+pgdx get tables --maintenance         # autovacuum recency + stats staleness: last vacuum/analyze, mods since analyze
 pgdx get tables -o mermaid            # schema ER diagram: tables + FK relationships (--all-columns for every column)
 pgdx get indexes [--table T] [--unused]  # indexes + scan counts; --unused = drop candidates
 pgdx get indexes --sort size          # order by index size (biggest first); also --sort scans | name
@@ -259,6 +265,7 @@ pgdx get extensions --available       # everything installable here (version, in
 pgdx get databases [--sort name|size] # databases: size, conns, commits/writes (activity)
 pgdx get databases --sample 5s        # COMMITS/s + WRITES/s — is a database actually active?
 pgdx get databases --wide             # add health columns: HIT%, ROLLBACK%, DEADLOCKS, TEMP, STATS-RESET
+pgdx get tablespaces                  # tablespaces: owner, on-disk size, location
 pgdx get roles                        # roles/users: attributes, memberships, live sessions (alias: users)
 pgdx get settings [name...] [--all]   # server config (curated subset by default)
 
@@ -364,13 +371,15 @@ database — `snapshot` only writes a local file.
 ### Security
 
 ```bash
-pgdx audit                            # security hardening checks, grouped by severity
-pgdx audit -o json                    # structured findings (check id, severity, remediation)
+pgdx audit                            # security + reliability hygiene checks, grouped by section
+pgdx audit -o json                    # structured findings (check id, category, severity, remediation)
 pgdx audit --exit-code                # exit 1 if any warning/critical finding (CI gating)
 ```
 
-`audit` runs read-only hardening checks and reports findings by severity, each with a
-one-line fix:
+`audit` runs read-only hygiene checks and reports findings in two sections — **SECURITY**
+and **RELIABILITY** — each ordered by severity with a one-line fix.
+
+Security:
 
 - login roles with SUPERUSER or BYPASSRLS
 - login roles holding a "superuser-lite" predefined role — `pg_execute_server_program`
@@ -386,6 +395,16 @@ one-line fix:
   `md5` auth
 - installed untrusted procedural languages (`plpython3u`, `plperlu`, …)
 - connection audit logging (`log_connections`/`log_disconnections`) off (info)
+
+Reliability:
+
+- crash-safety GUCs turned off — `fsync` and `full_page_writes` (critical, risk corruption
+  on crash), `zero_damaged_pages` on (warning, silent data loss), `synchronous_commit` off
+  (info, a deliberate durability trade-off)
+- `autovacuum` disabled (critical — invites bloat and XID wraparound), or `track_counts` off
+  (warning — starves autovacuum of the stats it triggers on)
+- checkpoints mostly *forced* by WAL volume rather than the timer — evidence `max_wal_size`
+  is too small (warning, with the actual ratio in the detail)
 
 The bootstrap superuser and cloud-provider-managed superusers (AWS RDS's `rdsadmin`, GCP
 Cloud SQL's `cloudsqladmin`, Azure's `azuresu`) are reported at **info**, not warning — they
@@ -415,7 +434,10 @@ A bare name that exists in multiple schemas asks you to qualify it.
 
 `analyze` is the fix when `get tables` shows blank ROWS/DEAD% (no statistics — e.g. just
 after a restore). ANALYZE only samples rows and runs online, but whole-database analyze is
-deliberate: it requires `--all`, never a bare `pgdx analyze`.
+deliberate: it requires `--all`, never a bare `pgdx analyze`. To find *which* tables need
+it, `get tables --maintenance` ranks them by MODS-SINCE-ANALYZE (rows changed since the
+last ANALYZE) and shows when each was last vacuumed/analyzed — the tables autovacuum is
+falling behind on rise to the top.
 
 ## Output
 
