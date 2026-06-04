@@ -99,7 +99,7 @@ func newRootCmd() *cobra.Command {
 	root.PersistentFlags().StringVar(&flagDSN, "dsn", "",
 		"connection string or postgres:// URI (default: PG* env vars / .pgpass, like psql)")
 	root.PersistentFlags().StringVarP(&flagOutput, "output", "o", "table",
-		"output format: table | json (describe table also supports: mermaid)")
+		"output format: table | json (describe & get tables also support ddl; describe table & get tables also mermaid)")
 	root.PersistentFlags().StringVarP(&flagDatabase, "database", "d", "",
 		"connect to this database instead of the default (needs CONNECT on it)")
 	root.PersistentFlags().BoolVar(&flagSQL, "sql", false,

@@ -20,7 +20,8 @@ type Format string
 const (
 	FormatTable   Format = "table"   // default, human-readable
 	FormatJSON    Format = "json"    // machine-readable, jq-clean
-	FormatMermaid Format = "mermaid" // ER diagram; only `describe table` supports it
+	FormatMermaid Format = "mermaid" // ER diagram; only `describe table`/`get tables` support it
+	FormatDDL     Format = "ddl"     // CREATE TABLE; only `describe table`/`get tables` support it
 	FormatYAML    Format = "yaml"    // deferred (D-direction): not yet supported
 	FormatWide    Format = "wide"    // deferred: not yet supported
 )

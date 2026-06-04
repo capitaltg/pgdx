@@ -45,6 +45,61 @@ func TestTableRows(t *testing.T) {
 	}
 }
 
+func TestAgoHuman(t *testing.T) {
+	cases := []struct {
+		name string
+		secs float64
+		want string
+	}{
+		{"never happened", -1, "never"},
+		{"under a minute", 12, "just now"},
+		{"minutes", 5 * 60, "5m ago"},
+		{"hours", 3 * 3600, "3h ago"},
+		{"days", 2 * 86400, "2d ago"},
+		{"weeks", 21 * 86400, "3w ago"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := agoHuman(tc.secs); got != tc.want {
+				t.Fatalf("agoHuman(%v) = %q, want %q", tc.secs, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTableMaintenanceView(t *testing.T) {
+	rows := tableMaintenanceView{
+		{Schema: "public", Name: "orders", LiveTup: 900, DeadTup: 100,
+			VacuumAgeSec: 3 * 86400, AnalyzeAgeSec: -1, ModsSinceAnalyze: 12345, AutovacuumCount: 47},
+	}.Rows()
+	got := rows[0]
+	// SCHEMA NAME DEAD% LAST-VACUUM LAST-ANALYZE MODS-SINCE-ANALYZE AUTOVAC
+	want := []string{"public", "orders", "10%", "3d ago", "never", "12,345", "47"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("column %d = %q, want %q (row %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestTablespacesView(t *testing.T) {
+	rows := tablespacesView{
+		{Name: "pg_default", Owner: "postgres", SizeBytes: 136 << 20, Location: ""},
+		{Name: "fast_ssd", Owner: "app", SizeBytes: -1, Location: "/mnt/ssd/pg"},
+	}.Rows()
+	// Built-in: humanized size, blank location → "(data directory)".
+	if got := rows[0][3]; got != "(data directory)" {
+		t.Fatalf("built-in LOCATION = %q, want \"(data directory)\"", got)
+	}
+	// Unprivileged size → "—"; real location passes through.
+	if got := rows[1][2]; got != "—" {
+		t.Fatalf("unprivileged SIZE = %q, want \"—\"", got)
+	}
+	if got := rows[1][3]; got != "/mnt/ssd/pg" {
+		t.Fatalf("LOCATION = %q, want \"/mnt/ssd/pg\"", got)
+	}
+}
+
 func TestActivityView_FullQuery(t *testing.T) {
 	// A query longer than the 60-rune table cap, with newlines to flatten.
 	long := "SELECT a, b, c\nFROM some_table\nWHERE col = 'a-fairly-long-literal-value' AND other_col > 100 ORDER BY a"

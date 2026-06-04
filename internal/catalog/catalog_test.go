@@ -589,6 +589,31 @@ func TestBuildTableUsageQuery(t *testing.T) {
 	})
 }
 
+func TestBuildTableMaintenanceQuery(t *testing.T) {
+	t.Run("most-stale first, no schema", func(t *testing.T) {
+		sql, args := buildTableMaintenanceQuery("")
+		if len(args) != 0 {
+			t.Fatalf("want no args, got %v", args)
+		}
+		for _, want := range []string{
+			"GREATEST(s.last_vacuum, s.last_autovacuum)",
+			"GREATEST(s.last_analyze, s.last_autoanalyze)",
+			"n_mod_since_analyze", "autovacuum_count",
+			"ORDER BY COALESCE(s.n_mod_since_analyze, 0) DESC",
+		} {
+			if !strings.Contains(sql, want) {
+				t.Fatalf("maintenance query missing %q:\n%s", want, sql)
+			}
+		}
+	})
+	t.Run("schema filter parameterized", func(t *testing.T) {
+		sql, args := buildTableMaintenanceQuery("app")
+		if len(args) != 1 || args[0] != "app" || !strings.Contains(sql, "n.nspname = $1") {
+			t.Fatalf("schema filter wrong: args=%v\n%s", args, sql)
+		}
+	})
+}
+
 func TestConstraintType(t *testing.T) {
 	cases := map[string]string{
 		"p": "primary key", "f": "foreign key", "u": "unique",

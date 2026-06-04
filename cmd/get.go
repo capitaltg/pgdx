@@ -36,6 +36,7 @@ func newGetCmd() *cobra.Command {
 	c.AddCommand(newGetProgressCmd())
 	c.AddCommand(newGetReplicationCmd())
 	c.AddCommand(newGetDatabasesCmd())
+	c.AddCommand(newGetTablespacesCmd())
 	c.AddCommand(newGetRolesCmd())
 	c.AddCommand(newGetBloatCmd())
 	c.AddCommand(newGetTransactionAgeCmd())
@@ -1570,6 +1571,7 @@ func compactQuery(s string, max int) string {
 func newGetTablesCmd() *cobra.Command {
 	var schema string
 	var usage bool
+	var maintenance bool
 	var allColumns bool
 	c := &cobra.Command{
 		Use:   "tables",
@@ -1585,16 +1587,26 @@ func newGetTablesCmd() *cobra.Command {
 			"scans (with IDX% — the share served by an index) and insert/update/delete counts,\n" +
 			"most sequentially-scanned first. A big, heavily seq-scanned table with a low IDX%\n" +
 			"is a prime candidate for a better index.\n\n" +
+			"--maintenance swaps them instead for autovacuum recency and stats staleness: when\n" +
+			"each table was last vacuumed and analyzed, MODS-SINCE-ANALYZE (rows changed since\n" +
+			"the last ANALYZE — the stale-statistics signal behind bad row estimates), and how\n" +
+			"many times autovacuum has run. Most-stale first, so the tables autovacuum is\n" +
+			"neglecting rise to the top. LAST-* read 'never' until the first (auto)vacuum/analyze.\n\n" +
 			"-o mermaid emits an entity-relationship diagram of the schema: every table and the\n" +
 			"foreign keys between them. By default each table shows only its key columns (PK/FK/\n" +
 			"unique); add --all-columns for every column. Pair with --schema on a large database\n" +
-			"to keep the diagram readable.",
+			"to keep the diagram readable.\n\n" +
+			"-o ddl emits CREATE TABLE for every table (foreign keys deferred to trailing ALTER\n" +
+			"TABLE statements so the script replays in any order). It's a readable reference, not\n" +
+			"a pg_dump replacement — it omits identity/generated syntax, storage params, comments,\n" +
+			"ownership, and grants. Pair with --schema to scope a large database.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			// get tables additionally supports -o mermaid (a schema ER diagram); accept it
-			// here rather than widening render.ParseFormat, which all commands share.
+			// get tables additionally supports -o mermaid (a schema ER diagram) and -o ddl
+			// (CREATE TABLE for every table); accept them here rather than widening
+			// render.ParseFormat, which all commands share.
 			format := render.Format(flagOutput)
-			if format != render.FormatMermaid {
+			if format != render.FormatMermaid && format != render.FormatDDL {
 				var err error
 				format, err = render.ParseFormat(flagOutput)
 				if err != nil {
@@ -1611,6 +1623,9 @@ func newGetTablesCmd() *cobra.Command {
 			defer release()
 
 			if format == render.FormatMermaid {
+				if usage || maintenance {
+					return usageError{"--usage/--maintenance can't be combined with -o mermaid"}
+				}
 				graph, err := catalog.BuildSchemaGraph(ctx, conn, schema)
 				if err != nil {
 					return err
@@ -1618,8 +1633,38 @@ func newGetTablesCmd() *cobra.Command {
 				return renderSchemaMermaid(cmd.OutOrStdout(), graph, allColumns)
 			}
 
+			if format == render.FormatDDL {
+				if usage || maintenance {
+					return usageError{"--usage/--maintenance can't be combined with -o ddl"}
+				}
+				tables, err := catalog.ListTables(ctx, conn, schema)
+				if err != nil {
+					return err
+				}
+				if len(tables) == 0 {
+					msg := "no tables found"
+					if schema != "" {
+						msg += fmt.Sprintf(" in schema %q", schema)
+					}
+					fmt.Fprintln(cmd.ErrOrStderr(), msg)
+					return nil
+				}
+				details := make([]*catalog.TableDetail, 0, len(tables))
+				for _, t := range tables {
+					d, err := catalog.DescribeTable(ctx, conn, t.Schema+"."+t.Name)
+					if err != nil {
+						return err
+					}
+					details = append(details, d)
+				}
+				return renderSchemaDDL(cmd.OutOrStdout(), details)
+			}
+
 			if usage {
 				return runTableUsage(cmd, ctx, conn, schema, format)
+			}
+			if maintenance {
+				return runTableMaintenance(cmd, ctx, conn, schema, format)
 			}
 
 			tables, err := catalog.ListTables(ctx, conn, schema)
@@ -1647,6 +1692,8 @@ func newGetTablesCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&schema, "schema", "", "limit to a single schema (default: all non-system schemas)")
 	c.Flags().BoolVar(&usage, "usage", false, "show read/write access patterns (seq vs index scans, ins/upd/del) instead of size")
+	c.Flags().BoolVar(&maintenance, "maintenance", false, "show autovacuum recency and stats staleness (last vacuum/analyze, mods since analyze) instead of size")
+	c.MarkFlagsMutuallyExclusive("usage", "maintenance")
 	c.Flags().BoolVar(&allColumns, "all-columns", false, "with -o mermaid, show every column (default: key columns only)")
 	return c
 }
@@ -1693,6 +1740,127 @@ func (v tableUsageView) Rows() [][]string {
 			withThousands(u.SeqScan), withThousands(u.IdxScan), idxPct,
 			withThousands(u.Inserts), withThousands(u.Updates), withThousands(u.Deletes),
 		})
+	}
+	return out
+}
+
+func runTableMaintenance(cmd *cobra.Command, ctx context.Context, conn *db.Conn, schema string, format render.Format) error {
+	rows, err := catalog.ListTableMaintenance(ctx, conn, schema)
+	if err != nil {
+		return err
+	}
+	if format == render.FormatJSON {
+		if rows == nil {
+			rows = []catalog.TableMaintenance{}
+		}
+		return render.Render(cmd.OutOrStdout(), format, rows)
+	}
+	if len(rows) == 0 {
+		fmt.Fprintln(cmd.ErrOrStderr(), "no tables found")
+		return nil
+	}
+	return render.Render(cmd.OutOrStdout(), render.FormatTable, tableMaintenanceView(rows))
+}
+
+type tableMaintenanceView []catalog.TableMaintenance
+
+func (v tableMaintenanceView) Headers() []string {
+	return []string{"SCHEMA", "NAME", "DEAD%", "LAST-VACUUM", "LAST-ANALYZE", "MODS-SINCE-ANALYZE", "AUTOVAC"}
+}
+func (v tableMaintenanceView) Aligns() []render.Align {
+	return []render.Align{
+		render.AlignLeft, render.AlignLeft, render.AlignRight,
+		render.AlignRight, render.AlignRight, render.AlignRight, render.AlignRight,
+	}
+}
+func (v tableMaintenanceView) Rows() [][]string {
+	out := make([][]string, 0, len(v))
+	for _, m := range v {
+		out = append(out, []string{
+			m.Schema, m.Name, deadPct(m.LiveTup, m.DeadTup),
+			agoHuman(m.VacuumAgeSec), agoHuman(m.AnalyzeAgeSec),
+			withThousands(m.ModsSinceAnalyze), withThousands(m.AutovacuumCount),
+		})
+	}
+	return out
+}
+
+// agoHuman renders an age in seconds as a compact, coarse "N<unit> ago" string for the
+// maintenance view, where the meaningful resolution is hours-to-weeks, not seconds. A
+// negative age — the event never happened — reads as "never".
+func agoHuman(s float64) string {
+	switch {
+	case s < 0:
+		return "never"
+	case s < 60:
+		return "just now"
+	case s < 3600:
+		return fmt.Sprintf("%dm ago", int(s)/60)
+	case s < 86400:
+		return fmt.Sprintf("%dh ago", int(s)/3600)
+	case s < 7*86400:
+		return fmt.Sprintf("%dd ago", int(s)/86400)
+	default:
+		return fmt.Sprintf("%dw ago", int(s)/(7*86400))
+	}
+}
+
+func newGetTablespacesCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "tablespaces",
+		Short: "List tablespaces with size and location",
+		Long: "tablespaces lists every tablespace in the cluster with its owner, on-disk size, and\n" +
+			"location. Most clusters use only the built-in pg_default (the data directory, where\n" +
+			"objects live unless placed elsewhere) and pg_global (shared catalogs) — extra rows\n" +
+			"mean someone put objects on separate storage. SIZE shows '—' for a tablespace you\n" +
+			"lack privilege to measure (needs CREATE on it, or pg_read_all_stats); LOCATION is\n" +
+			"blank for the built-ins, which live inside the data directory. Read-only.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			format, conn, release, err := connectForGet(cmd)
+			if err != nil {
+				return err
+			}
+			ctx := context.Background()
+			defer release()
+			rows, err := catalog.ListTablespaces(ctx, conn)
+			if err != nil {
+				return err
+			}
+			if format == render.FormatJSON {
+				if rows == nil {
+					rows = []catalog.Tablespace{}
+				}
+				return render.Render(cmd.OutOrStdout(), format, rows)
+			}
+			if len(rows) == 0 {
+				fmt.Fprintln(cmd.ErrOrStderr(), "no tablespaces found")
+				return nil
+			}
+			return render.Render(cmd.OutOrStdout(), render.FormatTable, tablespacesView(rows))
+		},
+	}
+	return c
+}
+
+type tablespacesView []catalog.Tablespace
+
+func (v tablespacesView) Headers() []string { return []string{"NAME", "OWNER", "SIZE", "LOCATION"} }
+func (v tablespacesView) Aligns() []render.Align {
+	return []render.Align{render.AlignLeft, render.AlignLeft, render.AlignRight, render.AlignLeft}
+}
+func (v tablespacesView) Rows() [][]string {
+	out := make([][]string, 0, len(v))
+	for _, t := range v {
+		size := "—" // not privileged to measure it
+		if t.SizeBytes >= 0 {
+			size = humanBytes(t.SizeBytes)
+		}
+		loc := t.Location
+		if loc == "" {
+			loc = "(data directory)"
+		}
+		out = append(out, []string{t.Name, t.Owner, size, loc})
 	}
 	return out
 }

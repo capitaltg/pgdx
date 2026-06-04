@@ -25,6 +25,31 @@ func TestPrintAuditFindingsEmpty(t *testing.T) {
 	}
 }
 
+func TestPrintAuditFindingsCategorized(t *testing.T) {
+	var out bytes.Buffer
+	a := &catalog.SecurityAudit{
+		Checks: 14,
+		Findings: []catalog.SecurityFinding{
+			{Check: "ssl", Category: catalog.CategorySecurity, Severity: catalog.SeverityWarning,
+				Title: "SSL disabled", Detail: "no TLS"},
+			{Check: "autovacuum-config", Category: catalog.CategoryReliability, Severity: catalog.SeverityCritical,
+				Title: "autovacuum is disabled", Detail: "bloat grows", Remediation: "set autovacuum = on"},
+		},
+	}
+	printAuditFindings(&out, a)
+	o := out.String()
+
+	for _, want := range []string{"SECURITY", "RELIABILITY", "autovacuum is disabled"} {
+		if !strings.Contains(o, want) {
+			t.Fatalf("output missing %q:\n%s", want, o)
+		}
+	}
+	// Security section precedes the reliability section.
+	if strings.Index(o, "SECURITY") > strings.Index(o, "RELIABILITY") {
+		t.Fatalf("SECURITY section must precede RELIABILITY:\n%s", o)
+	}
+}
+
 func TestPrintAuditFindingsGrouped(t *testing.T) {
 	var out bytes.Buffer
 	a := &catalog.SecurityAudit{
