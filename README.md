@@ -4,6 +4,8 @@
 server is doing right now, and diagnose slow queries — with a consistent, scriptable
 grammar instead of arcane `psql` meta-commands.
 
+![pgdx — one-shot commands or a resident read-only shell](demo/shell.gif)
+
 ```console
 $ pgdx explain "select count(*) from awards"
 ⚠ Full sequential scan on "awards" dominates the query
@@ -255,6 +257,7 @@ pgdx get tables [--schema S]          # tables: size, est rows, DEAD% (bloat)
 pgdx get tables --usage               # read/write patterns: seq vs index scans (IDX%), ins/upd/del
 pgdx get tables --maintenance         # autovacuum recency + stats staleness: last vacuum/analyze, mods since analyze
 pgdx get tables -o mermaid            # schema ER diagram: tables + FK relationships (--all-columns for every column)
+pgdx get tables -o ddl                # CREATE TABLE for every table (FKs deferred to trailing ALTER TABLE)
 pgdx get indexes [--table T] [--unused]  # indexes + scan counts; --unused = drop candidates
 pgdx get indexes --sort size          # order by index size (biggest first); also --sort scans | name
 pgdx get indexes --redundant          # indexes covered by another (duplicate or prefix) — safe drops
@@ -269,11 +272,9 @@ pgdx get tablespaces                  # tablespaces: owner, on-disk size, locati
 pgdx get roles                        # roles/users: attributes, memberships, live sessions (alias: users)
 pgdx get settings [name...] [--all]   # server config (curated subset by default)
 
-pgdx describe table <name>            # columns, indexes, constraints, incoming FKs, partitions, bloat
-pgdx describe table <name> --stats    # + per-column planner stats (n_distinct, null frac, correlation)
-pgdx describe table <name> -o mermaid # ER diagram: columns + keys + FK relationships
-pgdx describe index <name>            # method, validity, usage, definition
-pgdx describe view <name>             # columns + definition
+pgdx describe table <name> [--stats]  # columns, indexes, constraints, incoming FKs, partitions, bloat (+planner stats)
+pgdx describe index|view|function|sequence <name>  # detail for one object
+#   any describe target & `get tables` also take -o ddl; table/get tables also -o mermaid — see Output formats
 
 pgdx query "<read-only sql>"          # run arbitrary SELECT in a READ ONLY tx, rendered like everything else
 ```
@@ -470,6 +471,29 @@ block, or pipe it straight to an image:
 pgdx describe table orders -o mermaid | mmdc -i - -o orders.svg
 pgdx get tables --schema public -o mermaid | mmdc -i - -o schema.svg
 ```
+
+Every `describe` object also supports `-o ddl`, as does `get tables`:
+
+| Command | DDL emitted |
+| --- | --- |
+| `describe table <name> -o ddl` | `CREATE TABLE` — columns, PK/unique/check/FK constraints, indexes, partition-by (FKs inline) |
+| `get tables [--schema S] -o ddl` | `CREATE TABLE` for every table, with FKs deferred to trailing `ALTER TABLE` so it replays in any order |
+| `describe view <name> -o ddl` | `CREATE [OR REPLACE] VIEW` / `CREATE MATERIALIZED VIEW ... WITH [NO] DATA` |
+| `describe index <name> -o ddl` | the exact `CREATE INDEX` (from `pg_get_indexdef`) |
+| `describe function <name> -o ddl` | `CREATE OR REPLACE FUNCTION` for each overload (from `pg_get_functiondef`) |
+| `describe sequence <name> -o ddl` | `CREATE SEQUENCE` with explicit bounds, increment, cache, cycle |
+
+```bash
+pgdx describe table orders -o ddl              # one table's CREATE TABLE
+pgdx get tables --schema public -o ddl > schema.sql
+pgdx describe function calculate_total -o ddl  # the function source, ready to re-create
+```
+
+This is a readable **reference / scaffold**, not a `pg_dump` replacement: it omits
+identity/generated-column syntax (these surface only as a `DEFAULT`), storage parameters,
+tablespaces, comments, ownership, grants, RLS, triggers, and sequence `OWNED BY`. Index and
+function DDL come straight from Postgres builtins and are exact; the rest is assembled. Use
+`pg_dump --schema-only` for backups and migrations.
 
 **See the SQL:** the global `--sql` flag prints every query pgdx runs (to stderr — so it
 never mixes with `-o json` on stdout). Handy for learning, copying a query, or auditing.
