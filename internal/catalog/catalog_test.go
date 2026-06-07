@@ -109,6 +109,34 @@ func TestBuildIndexesQuery(t *testing.T) {
 	})
 }
 
+func TestBuildLowYieldIndexesQuery(t *testing.T) {
+	t.Run("no filters: min-size only", func(t *testing.T) {
+		sql, args := buildLowYieldIndexesQuery("", "", 1<<20)
+		if len(args) != 1 || args[0] != int64(1<<20) {
+			t.Fatalf("args = %v, want [1048576]", args)
+		}
+		for _, want := range []string{
+			"NOT ix.indisunique",
+			"COALESCE(s.idx_scan, 0) >= 1",
+			"pg_catalog.pg_relation_size(i.oid) >= $1",
+			"pg_relation_size(i.oid) / GREATEST(COALESCE(s.idx_scan, 0), 1) DESC",
+		} {
+			if !strings.Contains(sql, want) {
+				t.Fatalf("query missing %q:\n%s", want, sql)
+			}
+		}
+	})
+	t.Run("schema and table filters get distinct placeholders", func(t *testing.T) {
+		sql, args := buildLowYieldIndexesQuery("public", "orders", 10<<20)
+		if len(args) != 3 || args[0] != int64(10<<20) || args[1] != "public" || args[2] != "orders" {
+			t.Fatalf("args = %v, want [10485760 public orders]", args)
+		}
+		if !strings.Contains(sql, "n.nspname = $2") || !strings.Contains(sql, "t.relname = $3") {
+			t.Fatalf("placeholders not numbered after min-size:\n%s", sql)
+		}
+	})
+}
+
 func TestValidIndexSort(t *testing.T) {
 	for _, k := range IndexSortKeys {
 		if !ValidIndexSort(k) {

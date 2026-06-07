@@ -4,6 +4,8 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/capitaltg/pgdx/internal/catalog"
 )
 
 func TestReportAnalyzeRows(t *testing.T) {
@@ -47,6 +49,7 @@ func TestAnalyzeTargetValidation(t *testing.T) {
 		{"no target errors (no accidental whole-db)", []string{}, "specify a table"},
 		{"table plus --all conflicts", []string{"orders", "--all"}, "only one"},
 		{"--schema plus --all conflicts", []string{"--schema", "app", "--all"}, "only one"},
+		{"columns with --schema rejected", []string{"--schema", "app", "orders", "id"}, "only one"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -62,5 +65,44 @@ func TestAnalyzeTargetValidation(t *testing.T) {
 				t.Fatalf("Execute(%v) err = %q, want substring %q", tc.args, err.Error(), tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestReportAnalyzeMulti(t *testing.T) {
+	mk := func(s, n string, est int64) catalog.Table {
+		return catalog.Table{Schema: s, Name: n, EstRows: est}
+	}
+	before := []catalog.Table{
+		mk("public", "orders", -1),    // newly populated
+		mk("public", "events", 1000),  // big move
+		mk("public", "users", 1000),   // tiny move (noise)
+		mk("public", "settings", 500), // unchanged
+	}
+	after := []catalog.Table{
+		mk("public", "orders", 50000),
+		mk("public", "events", 12500),
+		mk("public", "users", 1010),
+		mk("public", "settings", 500),
+	}
+
+	var b strings.Builder
+	reportAnalyzeMulti(&b, before, after, false)
+	got := b.String()
+	for _, want := range []string{"notable changes:", "public.orders", "public.events", "2 other tables unchanged"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("default output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "public.users") || strings.Contains(got, "public.settings") {
+		t.Fatalf("default output should not list noise/unchanged tables:\n%s", got)
+	}
+
+	b.Reset()
+	reportAnalyzeMulti(&b, before, after, true)
+	got = b.String()
+	for _, want := range []string{"row estimates:", "public.orders", "public.events", "public.users", "public.settings", "(unchanged)"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("verbose output missing %q:\n%s", want, got)
+		}
 	}
 }

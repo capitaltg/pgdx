@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"io"
 	"strings"
 	"testing"
 
@@ -128,4 +129,61 @@ func TestActivityView_FullQuery(t *testing.T) {
 			t.Fatalf("--full QUERY should contain the tail of the statement, got %q", got)
 		}
 	})
+}
+
+func TestParseSize(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int64
+		ok   bool
+	}{
+		{"1MB", 1 << 20, true},
+		{"10mb", 10 << 20, true},
+		{"1GB", 1 << 30, true},
+		{"512KB", 512 << 10, true},
+		{"2048", 2048, true},
+		{"100B", 100, true},
+		{"  1M  ", 1 << 20, true},
+		{"", 0, false},
+		{"abc", 0, false},
+		{"-1MB", 0, false},
+	}
+	for _, c := range cases {
+		got, err := parseSize(c.in)
+		if c.ok {
+			if err != nil {
+				t.Errorf("parseSize(%q) err = %v, want %d", c.in, err, c.want)
+				continue
+			}
+			if got != c.want {
+				t.Errorf("parseSize(%q) = %d, want %d", c.in, got, c.want)
+			}
+		} else if err == nil {
+			t.Errorf("parseSize(%q) = %d, want error", c.in, got)
+		}
+	}
+}
+
+func TestGetIndexesModeConflicts(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{"unused + low-yield", []string{"indexes", "--unused", "--low-yield"}, "at most one"},
+		{"redundant + low-yield", []string{"indexes", "--redundant", "--low-yield"}, "at most one"},
+		{"min-size without low-yield", []string{"indexes", "--unused", "--min-size", "10MB"}, "only applies to --low-yield"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newGetIndexesCmd()
+			c.SetArgs(tc.args[1:])
+			c.SetOut(io.Discard)
+			c.SetErr(io.Discard)
+			err := c.Execute()
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Execute(%v) err = %v, want substring %q", tc.args, err, tc.wantErr)
+			}
+		})
+	}
 }

@@ -2107,6 +2107,8 @@ func newGetIndexesCmd() *cobra.Command {
 	var schema, table string
 	var unused bool
 	var redundant bool
+	var lowYield bool
+	var minSize string
 	var sortKey string
 	c := &cobra.Command{
 		Use:   "indexes",
@@ -2126,15 +2128,34 @@ func newGetIndexesCmd() *cobra.Command {
 			"These earn nothing on reads while still costing write amplification and disk, so\n" +
 			"they're safe, high-confidence drop candidates (unlike --unused, this needs no usage\n" +
 			"history — it's structural). Partial and expression indexes are excluded, since their\n" +
-			"equivalence can't be judged from columns alone.",
+			"equivalence can't be judged from columns alone.\n\n" +
+			"--low-yield surfaces the long tail --unused misses: non-unique indexes that ARE\n" +
+			"scanned, but rarely relative to their size — a 40 GB index hit 12 times in a year\n" +
+			"is a better drop candidate than a 1 KB index never hit. Rows are ranked by\n" +
+			"bytes-per-scan, biggest waste first. Use --min-size to set the size floor (default\n" +
+			"1MB). Unlike --unused, this is a SUGGESTION list — verify the workload before\n" +
+			"dropping (a quarterly report may legitimately hit a huge index a few times).",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			format, err := render.ParseFormat(flagOutput)
 			if err != nil {
 				return usageError{err.Error()}
 			}
-			if unused && redundant {
-				return usageError{"pass either --unused or --redundant, not both"}
+			modes := 0
+			if unused {
+				modes++
+			}
+			if redundant {
+				modes++
+			}
+			if lowYield {
+				modes++
+			}
+			if modes > 1 {
+				return usageError{"pass at most one of --unused, --redundant, --low-yield"}
+			}
+			if cmd.Flags().Changed("min-size") && !lowYield {
+				return usageError{"--min-size only applies to --low-yield"}
 			}
 			if !catalog.ValidIndexSort(sortKey) {
 				return usageError{fmt.Sprintf("invalid --sort %q (want: %s)", sortKey, strings.Join(catalog.IndexSortKeys, ", "))}
@@ -2157,6 +2178,9 @@ func newGetIndexesCmd() *cobra.Command {
 
 			if redundant {
 				return runRedundantIndexes(cmd, ctx, conn, schema, table, format)
+			}
+			if lowYield {
+				return runLowYieldIndexes(cmd, ctx, conn, schema, table, minSize, format)
 			}
 
 			indexes, err := catalog.ListIndexes(ctx, conn, schema, table, unused, sortKey)
@@ -2183,8 +2207,116 @@ func newGetIndexesCmd() *cobra.Command {
 	c.Flags().StringVar(&table, "table", "", "limit to indexes on a single table")
 	c.Flags().BoolVar(&unused, "unused", false, "show only never-scanned, non-unique indexes (drop candidates), biggest first")
 	c.Flags().BoolVar(&redundant, "redundant", false, "show non-unique indexes already covered by another index (duplicate or prefix)")
+	c.Flags().BoolVar(&lowYield, "low-yield", false, "show large non-unique indexes with few scans (drop suggestions), ranked by bytes-per-scan")
+	c.Flags().StringVar(&minSize, "min-size", "1MB", "size floor for --low-yield (e.g. 1MB, 10MB, 1GB)")
 	c.Flags().StringVar(&sortKey, "sort", "name", "sort order: name | size (biggest first) | scans (most-used first)")
 	return c
+}
+
+// parseSize parses a human-readable size like "10MB" / "1GB" / "512KB" / "2048" (bytes).
+// Suffixes are case-insensitive: K/KB, M/MB, G/GB, B (or bare = bytes). Binary units (1024^n).
+func parseSize(s string) (int64, error) {
+	orig := s
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if s == "" {
+		return 0, fmt.Errorf("empty size")
+	}
+	var mult int64 = 1
+	switch {
+	case strings.HasSuffix(s, "GB"):
+		mult, s = 1<<30, strings.TrimSuffix(s, "GB")
+	case strings.HasSuffix(s, "MB"):
+		mult, s = 1<<20, strings.TrimSuffix(s, "MB")
+	case strings.HasSuffix(s, "KB"):
+		mult, s = 1<<10, strings.TrimSuffix(s, "KB")
+	case strings.HasSuffix(s, "G"):
+		mult, s = 1<<30, strings.TrimSuffix(s, "G")
+	case strings.HasSuffix(s, "M"):
+		mult, s = 1<<20, strings.TrimSuffix(s, "M")
+	case strings.HasSuffix(s, "K"):
+		mult, s = 1<<10, strings.TrimSuffix(s, "K")
+	case strings.HasSuffix(s, "B"):
+		s = strings.TrimSuffix(s, "B")
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid size %q (try e.g. 1MB, 10MB, 1GB)", orig)
+	}
+	return n * mult, nil
+}
+
+func runLowYieldIndexes(cmd *cobra.Command, ctx context.Context, conn *db.Conn, schema, table, minSize string, format render.Format) error {
+	minBytes, err := parseSize(minSize)
+	if err != nil {
+		return usageError{err.Error()}
+	}
+	ix, err := catalog.ListLowYieldIndexes(ctx, conn, schema, table, minBytes)
+	if err != nil {
+		return err
+	}
+	printLowYieldCaveat(cmd, ctx, conn, minSize)
+	if format == render.FormatJSON {
+		if ix == nil {
+			ix = []catalog.LowYieldIndex{}
+		}
+		return render.Render(cmd.OutOrStdout(), format, ix)
+	}
+	if len(ix) == 0 {
+		fmt.Fprintf(cmd.ErrOrStderr(), "no low-yield indexes found at or above %s — every non-unique index either earns its scans or is small.\n", minSize)
+		return nil
+	}
+	return render.Render(cmd.OutOrStdout(), render.FormatTable, lowYieldIndexesView(ix))
+}
+
+// printLowYieldCaveat mirrors printUnusedCaveat: scan counts are only meaningful in
+// the context of the stats-reset window, so we report it explicitly.
+func printLowYieldCaveat(cmd *cobra.Command, ctx context.Context, conn *db.Conn, minSize string) {
+	e := cmd.ErrOrStderr()
+	resetText, ageSec, err := catalog.StatsResetAge(ctx, conn)
+	if err != nil || (resetText == "" && ageSec < 0) {
+		fmt.Fprintf(e, "showing non-unique indexes ≥ %s ranked by bytes-per-scan; stats were never explicitly reset, so this spans the database's full history — but Postgres records no start date, and a newly-created database looks the same. Verify the database isn't recent before treating any of these as drop candidates.\n", minSize)
+		return
+	}
+	when := resetText
+	if len(when) >= 10 {
+		when = when[:10]
+	}
+	var verdict string
+	switch {
+	case ageSec >= 30*86400:
+		verdict = "long enough to surface real long-tail waste — but a quarterly job may still legitimately hit a big index a few times. Confirm the workload before dropping."
+	case ageSec >= 7*86400:
+		verdict = "covers daily/weekly use, but may miss monthly jobs — treat as suggestion only."
+	default:
+		verdict = "a SHORT window — scan counts here are not yet meaningful. Don't act on this list."
+	}
+	fmt.Fprintf(e, "showing non-unique indexes ≥ %s ranked by bytes-per-scan over the last %s (stats reset %s) — %s\n",
+		minSize, ageHuman(ageSec), when, verdict)
+}
+
+type lowYieldIndexesView []catalog.LowYieldIndex
+
+func (v lowYieldIndexesView) Headers() []string {
+	return []string{"SCHEMA", "TABLE", "NAME", "SIZE", "SCANS", "BYTES/SCAN"}
+}
+
+func (v lowYieldIndexesView) Aligns() []render.Align {
+	return []render.Align{
+		render.AlignLeft, render.AlignLeft, render.AlignLeft,
+		render.AlignRight, render.AlignRight, render.AlignRight,
+	}
+}
+
+func (v lowYieldIndexesView) Rows() [][]string {
+	out := make([][]string, 0, len(v))
+	for _, ix := range v {
+		out = append(out, []string{
+			ix.Schema, ix.Table, ix.Name, ix.Size,
+			withThousands(ix.Scans),
+			humanBytes(ix.BytesPerScan),
+		})
+	}
+	return out
 }
 
 func runRedundantIndexes(cmd *cobra.Command, ctx context.Context, conn *db.Conn, schema, table string, format render.Format) error {

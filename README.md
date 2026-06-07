@@ -425,9 +425,10 @@ pgdx vacuum <table>            # reclaim dead tuples (online, non-destructive)
 pgdx vacuum <table> --analyze  # also refresh planner stats
 pgdx vacuum <table> --full     # rewrite table (ACCESS EXCLUSIVE lock — asks to confirm)
 
-pgdx analyze <table>           # refresh planner statistics for one table
-pgdx analyze --schema app      # …for every table in a schema
-pgdx analyze --all             # …for every table in the current database
+pgdx analyze <table>                  # refresh planner statistics for one table
+pgdx analyze <table> <col1> <col2>    # …only these columns (e.g. after adding an index)
+pgdx analyze --schema app             # …for every table in a schema
+pgdx analyze --all                    # …for every table in the current database
 ```
 
 Table/index/view names can be bare (`orders`) or schema-qualified (`reporting.orders`).
