@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"unicode/utf8"
 )
 
 // Format is an output format selected by -o/--output.
@@ -88,15 +87,15 @@ func renderTable(w io.Writer, t Tabular) error {
 		copy(aligns, a.Aligns())
 	}
 
-	// Column widths = widest cell (header or any row), measured in runes so
-	// multi-byte glyphs like "—" don't throw off alignment.
+	// Column widths = widest cell (header or any row), measured in visible runes so
+	// multi-byte glyphs like "—" and color escapes don't throw off alignment.
 	widths := make([]int, ncol)
 	for i, h := range headers {
-		widths[i] = utf8.RuneCountInString(h)
+		widths[i] = visibleWidth(h)
 	}
 	for _, row := range rows {
 		for i := 0; i < ncol && i < len(row); i++ {
-			if l := utf8.RuneCountInString(row[i]); l > widths[i] {
+			if l := visibleWidth(row[i]); l > widths[i] {
 				widths[i] = l
 			}
 		}
@@ -109,7 +108,7 @@ func renderTable(w io.Writer, t Tabular) error {
 			if i < len(cells) {
 				cell = cells[i]
 			}
-			pad := widths[i] - utf8.RuneCountInString(cell)
+			pad := widths[i] - visibleWidth(cell)
 			if pad < 0 {
 				pad = 0
 			}
@@ -130,10 +129,20 @@ func renderTable(w io.Writer, t Tabular) error {
 		b.WriteByte('\n')
 	}
 
+	// A view whose last column is empty for every row (an optional notes column, say)
+	// would otherwise leave the gap and padding as trailing blanks on each line.
+	trimTrailing := func(s string) string {
+		lines := strings.Split(s, "\n")
+		for i, l := range lines {
+			lines[i] = strings.TrimRight(l, " ")
+		}
+		return strings.Join(lines, "\n")
+	}
+
 	writeRow(headers)
 	for _, row := range rows {
 		writeRow(row)
 	}
-	_, err := io.WriteString(w, b.String())
+	_, err := io.WriteString(w, trimTrailing(b.String()))
 	return err
 }

@@ -11,10 +11,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/capitaltg/pgdx/internal/db"
+	"github.com/capitaltg/pgdx/internal/render"
 )
 
 // version is overridden at build time via -ldflags.
@@ -28,6 +31,20 @@ var (
 	flagSQL      bool
 	flagTimeout  string
 )
+
+// useColor reports whether table output may use ANSI color. Every condition here is a
+// reason NOT to: a non-table format must stay machine-readable, a pipe or redirect means
+// something other than a human is reading, and NO_COLOR is the cross-tool opt-out
+// (no-color.org). --sql output goes to stderr and is never colored either way.
+func useColor() bool {
+	if flagOutput != string(render.FormatTable) {
+		return false
+	}
+	if _, set := os.LookupEnv("NO_COLOR"); set {
+		return false
+	}
+	return term.IsTerminal(int(os.Stdout.Fd()))
+}
 
 // sqlLog returns the writer that --sql echoes statements to (stderr, so it never mixes
 // with -o json on stdout), or nil when the flag is off.
@@ -95,6 +112,9 @@ func newRootCmd() *cobra.Command {
 		Version:       version,
 		SilenceUsage:  true, // we control when usage prints (exit code 2 path)
 		SilenceErrors: true, // main() prints errors to stderr itself
+		// Color is decided once, here, because this is the only layer that knows both the
+		// chosen -o format and whether stdout is a terminal.
+		PersistentPreRun: func(*cobra.Command, []string) { render.SetColor(useColor()) },
 	}
 	root.PersistentFlags().StringVar(&flagDSN, "dsn", "",
 		"connection string or postgres:// URI (default: PG* env vars / .pgpass, like psql)")

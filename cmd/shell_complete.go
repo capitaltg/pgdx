@@ -97,6 +97,9 @@ func objectNameCompleter(cmd *cobra.Command) readline.PrefixCompleterInterface {
 		kinds = []string{"r", "p", "m"} // VACUUM/ANALYZE target tables and materialized views
 	case cmd.Parent() != nil && cmd.Parent().Name() == "describe":
 		switch cmd.Name() {
+		case "role":
+			// Roles aren't relations, so they get their own name source rather than a relkind.
+			return readline.PcItemDynamic(func(string) []string { return roleNames() })
 		case "table":
 			kinds = []string{"r", "p"} // ordinary + partitioned tables
 		case "view":
@@ -157,6 +160,27 @@ func databaseNames() []string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	names, err := catalog.ListDatabaseNames(ctx, conn)
+	if err != nil {
+		return nil
+	}
+	completionNames.put(key, names)
+	return names
+}
+
+// roleNames lists role names for `describe role <TAB>` completion. Cached like object
+// names; errors yield no candidates.
+func roleNames() []string {
+	conn := sharedConn
+	if conn == nil {
+		return nil
+	}
+	const key = "\x00roles" // NUL-prefixed so it can't collide with a relkind key
+	if names, ok := completionNames.get(key); ok {
+		return names
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	names, err := catalog.ListRoleNames(ctx, conn)
 	if err != nil {
 		return nil
 	}

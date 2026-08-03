@@ -124,7 +124,8 @@ pgdx/analytics:reporting=> \q              # or: exit / quit / Ctrl-D
 ```
 
 - **Editing & history:** Tab-completes commands, flags, and — for `describe table|view|index`
-  and `vacuum` — live object names; ↑/↓ recall prior commands (history is saved to
+  and `vacuum` — live object names (plus role names for `describe role`); ↑/↓ recall prior
+  commands (history is saved to
   `~/.config/pgdx/shell_history`), Ctrl-R searches it, Ctrl/Alt-←/→ move by word, Home/End
   jump to the line ends, Ctrl-W deletes the previous word.
 - **`use <database>`** switches the session to another database (same server); **`use schema <name>`**
@@ -274,6 +275,8 @@ pgdx get settings [name...] [--all]   # server config (curated subset by default
 
 pgdx describe table <name> [--stats]  # columns, indexes, constraints, incoming FKs, partitions, bloat (+planner stats)
 pgdx describe index|view|function|sequence <name>  # detail for one object
+pgdx describe role <name>             # one role: memberships, ownership, effective privileges (alias: user)
+pgdx describe role <name> --privileges  # ...enumerating every relation, not a per-schema summary
 #   any describe target & `get tables` also take -o ddl; table/get tables also -o mermaid — see Output formats
 
 pgdx query "<read-only sql>"          # run arbitrary SELECT in a READ ONLY tx, rendered like everything else
@@ -289,6 +292,47 @@ partial/expression indexes, whose equivalence can't be judged from columns alone
 "is it safe to drop?" answer). `--stats` adds per-column `pg_stats`: a wrong `n_distinct`
 or stale stats are a leading cause of the row-estimate blowups `explain` flags, so this is
 where you confirm them.
+
+`describe role` is the drill-down `get roles` doesn't give you: memberships in **both**
+directions (who this role inherits, and who inherits it), role-scoped `ALTER ROLE ... SET`
+overrides that `get settings` can't show, the objects it owns (the "why won't `DROP ROLE`
+work?" answer, with the `REASSIGN OWNED` to fix it), `ALTER DEFAULT PRIVILEGES` entries
+(the usual "why can't the app role see the table we just created?" answer), and the
+sessions open as it right now.
+
+Privileges are reported **effective**, not as direct grants — they include what the role
+inherits through its memberships and what was granted to `PUBLIC`, which is what "can this
+role read that table?" actually means. (A `NOINHERIT` role is the exception worth knowing:
+its memberships grant nothing until it runs `SET ROLE`, so they're excluded and the output
+says so.) Relation access is summarized per schema by default; `--privileges` enumerates
+every relation, at the cost of a privilege check per relation.
+
+A privilege marked `✓*` is held via a grant to `PUBLIC` — i.e. **every** role has it, and it
+says nothing about this one. This matters more than it sounds: Postgres grants `CONNECT` and
+`TEMPORARY` to `PUBLIC` on every database and `USAGE` on schema `public` by default. An
+unmarked `✓` is what the role was actually given.
+
+Because that default is so common, objects where the role has *only* those defaults collapse
+instead of being listed — so a 40-database cluster reads
+
+```
+Databases:  all 40 databases: CONNECT*, TEMP* — nothing specific to this role
+```
+
+rather than forty identical rows. When some objects *are* special, they get the table and the
+rest collapse into a footer (`plus 37 other databases: CONNECT*, TEMP* (…)`). The collapse
+only fires when the collapsed objects grant identical privileges — a set that varies is always
+listed in full.
+
+The default output is built to stay near one screen without giving up the tabular layout:
+rows for objects the role has **no** access to are dropped (and named in a footer, so a
+short list never reads as a complete one), related tables are paired into two columns, and
+a superuser's privilege tables collapse to a single line — ACLs aren't consulted for one,
+so every cell would be a check mark. Whatever the terminal view elides, `-o json` always
+carries every row.
+Two limits are inherent, not pgdx's: the password **hash is never read** (only whether one
+is set, and only if you're superuser), and `SESSIONS` is connections open now — core
+Postgres keeps no last-login history, so an idle role and a retired one look identical.
 
 `query` is the read-only escape hatch: arbitrary SQL with pgdx's table/JSON rendering and
 guard rails, without dropping to `psql`. It runs inside a `READ ONLY` transaction (any
@@ -459,6 +503,12 @@ Data goes to stdout, warnings/errors to stderr, so pipelines stay clean:
 ```bash
 pgdx get indexes -o json | jq '.[] | select(.scans == 0 and .unique == false)'
 ```
+
+**Color** is used sparingly — only to make boolean columns scannable (`✓` green, `○` dim),
+never to carry information the text doesn't already state, so nothing is lost without it.
+It turns itself off for `-o json`, when stdout isn't a terminal (a pipe or a redirect), and
+when [`NO_COLOR`](https://no-color.org) is set. Piped output is therefore byte-identical to
+what you'd get with color unavailable.
 
 `describe table` and `get tables` additionally support `-o mermaid`, which emits a Mermaid
 `erDiagram`. For `describe table` it's one table — its columns (with `PK`/`FK`/`UK` tags and

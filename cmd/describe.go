@@ -24,6 +24,7 @@ func newDescribeCmd() *cobra.Command {
 	c.AddCommand(newDescribeViewCmd())
 	c.AddCommand(newDescribeFunctionCmd())
 	c.AddCommand(newDescribeSequenceCmd())
+	c.AddCommand(newDescribeRoleCmd())
 	return c
 }
 
