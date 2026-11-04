@@ -169,6 +169,82 @@ func ListIndexes(ctx context.Context, q Querier, schema, table string, unusedOnl
 	return out, rows.Err()
 }
 
+// LowYieldIndex is one row of `pgdx get indexes --low-yield`: a non-unique index that
+// is large relative to how rarely it's scanned — a drop candidate that's missed by
+// --unused (which requires strictly 0 scans). The signal is bytes-per-scan: a 40 GB
+// index hit 12 times is worse than a 1 KB index hit 0 times.
+type LowYieldIndex struct {
+	Index
+	SizeBytes    int64 `json:"size_bytes"`
+	BytesPerScan int64 `json:"bytes_per_scan"` // size_bytes / max(scans, 1)
+}
+
+// buildLowYieldIndexesQuery returns non-unique indexes whose size is at or above
+// minSizeBytes AND have at least one scan, ordered by bytes-per-scan descending —
+// "most waste per use" first. Unique indexes are excluded (they earn their keep
+// enforcing constraints). 0-scan indexes belong to --unused, not here.
+func buildLowYieldIndexesQuery(schema, table string, minSizeBytes int64) (string, []any) {
+	args := []any{minSizeBytes}
+	q := `SELECT n.nspname AS schema,
+       t.relname AS tablename,
+       i.relname AS name,
+       ix.indisunique AS is_unique,
+       pg_catalog.pg_size_pretty(pg_catalog.pg_relation_size(i.oid)) AS size,
+       pg_catalog.pg_relation_size(i.oid)::bigint AS size_bytes,
+       COALESCE(s.idx_scan, 0) AS scans,
+       pg_catalog.pg_get_indexdef(i.oid) AS definition
+FROM pg_catalog.pg_index ix
+JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid
+JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace
+LEFT JOIN pg_catalog.pg_stat_user_indexes s ON s.indexrelid = ix.indexrelid
+WHERE n.nspname !~ '^pg_'
+  AND n.nspname <> 'information_schema'
+  AND NOT ix.indisunique
+  AND COALESCE(s.idx_scan, 0) >= 1
+  AND pg_catalog.pg_relation_size(i.oid) >= $1`
+	if schema != "" {
+		args = append(args, schema)
+		q += fmt.Sprintf("\n  AND n.nspname = $%d", len(args))
+	}
+	if table != "" {
+		args = append(args, table)
+		q += fmt.Sprintf("\n  AND t.relname = $%d", len(args))
+	}
+	// Bytes-per-scan desc, with a stable tiebreaker on size then identifier order.
+	q += `
+ORDER BY pg_catalog.pg_relation_size(i.oid) / GREATEST(COALESCE(s.idx_scan, 0), 1) DESC,
+         pg_catalog.pg_relation_size(i.oid) DESC,
+         n.nspname, t.relname, i.relname`
+	return q, args
+}
+
+// ListLowYieldIndexes returns large non-unique indexes with low scan counts —
+// drop candidates missed by --unused. See buildLowYieldIndexesQuery for the filter
+// and ranking; minSizeBytes is the size floor (e.g. 1<<20 for 1 MB).
+func ListLowYieldIndexes(ctx context.Context, q Querier, schema, table string, minSizeBytes int64) ([]LowYieldIndex, error) {
+	sql, args := buildLowYieldIndexesQuery(schema, table, minSizeBytes)
+	rows, err := q.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LowYieldIndex
+	for rows.Next() {
+		var ix LowYieldIndex
+		if err := rows.Scan(&ix.Schema, &ix.Table, &ix.Name, &ix.Unique, &ix.Size, &ix.SizeBytes, &ix.Scans, &ix.Definition); err != nil {
+			return nil, err
+		}
+		scans := ix.Scans
+		if scans < 1 {
+			scans = 1
+		}
+		ix.BytesPerScan = ix.SizeBytes / scans
+		out = append(out, ix)
+	}
+	return out, rows.Err()
+}
+
 // RedundantIndex is one row of `pgdx get indexes --redundant`: a non-unique index whose
 // leading columns are already covered by another index on the same table, so it earns
 // nothing on reads while still costing write amplification and disk.
@@ -3450,33 +3526,4 @@ WHERE c.oid = $1`, oid)
 		}
 	}
 	return s, rows.Err()
-}
-
-// CountTablesForAnalyze counts ordinary + partitioned tables in scope (a single schema, or
-// every non-system schema when schema is empty) and, of those, how many have never been
-// analyzed (reltuples < 0). It lets `pgdx analyze --all`/`--schema` report a concise
-// summary — "N tables, M had no prior statistics" — without enumerating every name.
-func CountTablesForAnalyze(ctx context.Context, q Querier, schema string) (total, missing int, err error) {
-	sql := `SELECT count(*), count(*) FILTER (WHERE c.reltuples < 0)
-FROM pg_catalog.pg_class c
-JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-WHERE c.relkind IN ('r', 'p')
-  AND n.nspname !~ '^pg_'
-  AND n.nspname <> 'information_schema'`
-	var args []any
-	if schema != "" {
-		args = append(args, schema)
-		sql += "\n  AND n.nspname = $1"
-	}
-	rows, err := q.Query(ctx, sql, args...)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer rows.Close()
-	if rows.Next() {
-		if err := rows.Scan(&total, &missing); err != nil {
-			return 0, 0, err
-		}
-	}
-	return total, missing, rows.Err()
 }
