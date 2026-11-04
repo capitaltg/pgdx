@@ -3,7 +3,7 @@
 # --- Build stage -------------------------------------------------------------
 # Run the build on the native runner arch (BUILDPLATFORM) and cross-compile to
 # the requested target — avoids slow QEMU emulation for multi-arch builds.
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine AS build
 
 # Version stamped into the binary (matches the Makefile's -ldflags target).
 ARG VERSION=dev
