@@ -55,7 +55,7 @@ jobs:
       - name: Set up Buildx
         # The default "docker" driver can't export to the GHA cache; the
         # docker-container driver Buildx sets up here can.
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build image for scanning
         # Single-arch amd64 build loaded into the local daemon so Trivy can scan
@@ -72,11 +72,32 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Install Trivy
+        # Installed from the GitHub release (checksum-verified) rather than by
+        # trivy-action's setup-trivy, whose install script downloads from
+        # get.trivy.dev — that host stopped resolving on 2026-11-03
+        # (aquasecurity/setup-trivy#42). Drop this step and skip-setup-trivy
+        # once that's fixed.
+        env:
+          TRIVY_VERSION: 0.76.1
+        run: |
+          f="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          sums="trivy_${TRIVY_VERSION}_checksums.txt"
+          base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o "$f" "$base/$f"
+          curl -fsSL -o "$sums" "$base/$sums"
+          grep "  ${f}\$" "$sums" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$f" -C "$HOME/.local/bin" trivy
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Scan image with Trivy
         # Fail on fixable CRITICAL/HIGH vulnerabilities; unfixed ones are reported
         # but don't break the build (ignore-unfixed).
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@8f28faec26515256b6d22074d1d2a8986f4cbd87 # master 2026-10-21
         with:
+          skip-setup-trivy: true
           image-ref: pgdx:scan
           format: table
           severity: CRITICAL,HIGH
